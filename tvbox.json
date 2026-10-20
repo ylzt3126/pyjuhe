@@ -769,6 +769,24 @@
       "name": "📺直播｜咖啡直播",
       "type": 3,
       "api": "https://cdn.jsdelivr.net/gh/zxsla/pyjuhe@main/py_kafeizhibo.py"
+    },
+    {
+      "key": "py_lanrendianying",
+      "name": "🎬影视｜懒人电影",
+      "type": 3,
+      "api": "./py_lanrendianying.py"
+    },
+    {
+      "key": "py_pipiyingshi",
+      "name": "🎬影视｜皮皮影视",
+      "type": 3,
+      "api": "./py_pipiyingshi.py"
+    },
+    {
+      "key": "py_yingshimao",
+      "name": "🎬影视｜影视猫",
+      "type": 3,
+      "api": "./py_yingshimao.py"
     }
   ],
   "parses": [
