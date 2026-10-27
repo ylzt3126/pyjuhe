@@ -13,10 +13,27 @@ import time
 import hmac
 import hashlib
 import os
+import re
 import urllib.parse
 
 sys.path.append('..')
 from base.spider import Spider
+
+# 只保留 url_kind == "resolve_ticket" 的官方线路。
+# 部分长尾片源（老片/冷门片）整条记录都没有官方线路，只有第三方 m3u8；
+# 此时若不回退，该记录会完全无法播放。置为 False 则严格只显示官方线路。
+DIRECT_FALLBACK_WHEN_NO_TICKET = True
+
+# ---------------- 账号会话（全部内联，运行期不写任何文件） ----------------
+# 站点官方线路第 1 集免费，第 2 集起要求登录（playback_user_session_required）。
+# 下面三项就是默认凭据：Cookie 失效时会用账号密码自动重登，新会话只存在内存里。
+# 站点按 ai_movie_browser 设备号维度维护会话，同设备重复登录会顶掉旧会话，
+# 这里固定使用爬虫自己的设备号，避免把浏览器上的登录态挤下线。
+DEFAULT_ACCOUNT = 'souju3126'
+DEFAULT_PASSWORD = 'souju3126'
+DEFAULT_DEVICE_ID = 'brw_PrZeOSXqyokMJK1cpOYdFbP4DRJFlkTI6jbGvQFs6g4'
+DEFAULT_COOKIE = ('ai_movie_session=ums_xiVI7j5HyPdHgT-h1Uaxuw1mpIwu8sln3r4YwGxpEYM; '
+                  'ai_movie_browser=' + DEFAULT_DEVICE_ID)
 
 
 class Spider(Spider):
@@ -31,6 +48,15 @@ class Spider(Spider):
             'Origin': self.site_url,
         }
         self.default_pic = 'https://pic.rmb.bdstatic.com/bjh/user/default.png'
+        # 会话来源优先级：配置项 cookie > 内置 DEFAULT_COOKIE；
+        # 账号密码同理（配置项 > 内置），用于 Cookie 失效时自动重登。
+        cookie, account, password = self._pick_credentials(extend)
+        self._account = account or DEFAULT_ACCOUNT
+        self._password = password or DEFAULT_PASSWORD
+        self._device_id = DEFAULT_DEVICE_ID
+        cookie = cookie or DEFAULT_COOKIE
+        if cookie:
+            self.headers['Cookie'] = cookie
         self.categories = {
             'movie': '电影',
             'series': '电视剧',
@@ -119,6 +145,160 @@ class Spider(Spider):
             ],
         }
 
+    # ---------------- 会话：配置解析 / 本地缓存 / 账号登录 ----------------
+
+    @staticmethod
+    def _as_params(extend):
+        """把配置项统一解析成 dict：支持 dict / JSON / 查询串。
+        注意 Cookie 值自身含 ';'，所以只按 '&' 切分，避免把 Cookie 截断。"""
+        if not extend:
+            return {}
+        if isinstance(extend, dict):
+            return dict(extend)
+        s = str(extend).strip()
+        if not s:
+            return {}
+        if s.startswith('{'):
+            try:
+                obj = json.loads(s)
+                return obj if isinstance(obj, dict) else {}
+            except Exception:
+                return {}
+        out = {}
+        for part in s.split('&'):
+            if '=' in part:
+                k, v = part.split('=', 1)
+                out[k.strip().lower()] = urllib.parse.unquote(v.strip())
+        return out
+
+    @classmethod
+    def _pick_credentials(cls, extend):
+        """返回 (cookie, account, password)。"""
+        p = cls._as_params(extend)
+        cookie = p.get('cookie') or ''
+        account = p.get('account') or p.get('user') or p.get('username') or ''
+        password = p.get('password') or p.get('pass') or p.get('pwd') or ''
+        if not cookie and not account and not password:
+            # 没识别出任何已知键时，才把整串当作裸 Cookie
+            s = str(extend or '').strip()
+            if s and not s.startswith(('{', '[')) and '=' in s:
+                cookie = s
+        return cls._clean_cookie(cookie), account.strip(), password.strip()
+
+    @staticmethod
+    def _clean_cookie(raw):
+        if not isinstance(raw, str):
+            return ''
+        raw = raw.strip()
+        if raw.lower().startswith('cookie:'):
+            raw = raw[7:].strip()
+        raw = raw.replace('\r', '').replace('\n', '')
+        # 配置位有时被填成接口地址等非 Cookie 内容，做基本校验避免污染请求头
+        if '=' not in raw or '://' in raw or len(raw) > 4096:
+            return ''
+        return raw
+
+    @staticmethod
+    def _parse_set_cookie(resp):
+        """从响应里取会话 Cookie。
+        不同内核的 headers 行为不一致（多值 / 逗号拼接 / 单个字符串），
+        这里统一拼成文本后按 ai_movie_* 名逐个匹配，后出现的非空值生效。"""
+        hdrs = getattr(resp, 'headers', None)
+        if hdrs is None:
+            return {}
+        chunks = []
+        for getter in ('getlist', 'get_all'):
+            fn = getattr(hdrs, getter, None)
+            if callable(fn):
+                try:
+                    chunks.extend([str(x) for x in (fn('Set-Cookie') or [])])
+                except Exception:
+                    pass
+                break
+        if not chunks:
+            # 大小写不敏感地扫描全部响应头（有的 CDN 直接下发小写 set-cookie）
+            try:
+                items = hdrs.items() if hasattr(hdrs, 'items') else []
+                for k, v in items:
+                    if str(k).strip().lower() == 'set-cookie' and v:
+                        chunks.append(str(v))
+            except Exception:
+                pass
+        if not chunks:
+            try:
+                for key in ('Set-Cookie', 'set-cookie'):
+                    one = hdrs.get(key) if hasattr(hdrs, 'get') else None
+                    if isinstance(one, str) and one:
+                        chunks.append(one)
+                        break
+                    if one:
+                        chunks.extend([str(x) for x in one])
+                        break
+            except Exception:
+                pass
+        if not chunks:
+            return {}
+        text = ' | '.join(chunks)
+        jar = {}
+        for m in re.finditer(r'(ai_movie_[a-z0-9_]+)[=:]\s*([^;,\s|]*)', text, re.I):
+            name, value = m.group(1).strip(), m.group(2).strip()
+            if value:
+                jar[name] = value
+        return jar
+
+    def _merge_cookie(self, new_jar, base=None):
+        pairs = {}
+        for part in str(base if base is not None else self.headers.get('Cookie', '')).split(';'):
+            if '=' in part:
+                k, v = part.split('=', 1)
+                if k.strip():
+                    pairs[k.strip()] = v.strip()
+        for k, v in (new_jar or {}).items():
+            if v:
+                pairs[k] = v
+            else:
+                pairs.pop(k, None)
+        return '; '.join('{0}={1}'.format(k, v) for k, v in pairs.items())
+
+    def _login(self):
+        """用账号密码登录取会话，成功后只更新内存里的请求头（不落盘）。"""
+        if not self._account or not self._password:
+            return False
+        path = '/v1/users/password/login'
+        headers = self._sign_headers('POST', path)
+        # 用爬虫自己的设备号登录，避免顶掉浏览器上的会话
+        device = getattr(self, '_device_id', '') or DEFAULT_DEVICE_ID
+        base_cookie = 'ai_movie_browser=' + device
+        headers['Cookie'] = base_cookie
+        headers['Content-Type'] = 'application/json'
+        body = json.dumps({
+            'account': self._account,
+            'password': self._password,
+        }, ensure_ascii=False).encode('utf-8')
+        try:
+            resp = self._fetch_post(self.site_url + path, headers, body)
+        except Exception:
+            return False
+        code = getattr(resp, 'status_code', 0)
+        if code and int(code) >= 400:
+            return False
+        jar = self._parse_set_cookie(resp)
+        if not jar:
+            return False
+        if 'ai_movie_browser' not in jar:
+            jar['ai_movie_browser'] = device
+        else:
+            # 服务端可能回发自己的设备号，记下来供下次登录复用
+            self._device_id = jar['ai_movie_browser']
+        cookie = self._merge_cookie(jar, base='')
+        if '=' not in cookie:
+            return False
+        self.headers['Cookie'] = cookie
+        gated = getattr(self, '_gated_tokens', None)
+        if gated:
+            gated.clear()
+        return True
+
     def _sign_headers(self, method, path_with_search):
         ts = str(int(time.time() * 1000))
         nonce = os.urandom(16).hex()
@@ -183,8 +363,8 @@ class Spider(Spider):
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
             headers['Content-Type'] = 'application/json'
-        # GET 遇到空响应（限流/抖动）重试一次；POST 不重试，避免重复扣费
-        attempts = 2 if method == 'GET' else 1
+        # GET 遇到空响应（限流/抖动）退避重试；POST 不重试，避免重复扣费
+        attempts = 3 if method == 'GET' else 1
         for i in range(attempts):
             try:
                 if method == 'GET':
@@ -197,7 +377,7 @@ class Spider(Spider):
             if data:
                 return data
             if i + 1 < attempts:
-                time.sleep(0.25)
+                time.sleep(0.3 if i == 0 else 1.0)
         return {}
 
     def _api_get(self, path):
@@ -250,45 +430,57 @@ class Spider(Spider):
         return True
 
     @staticmethod
-    def _line_rank(opt):
-        """线路优先级：直链媒体 > 其它 http 地址 > 需二次解析的 ticket。
-        站点会给部分线路返回「第0集片头」图片/短视频（token_scenario=series_intro*），一律降为最低。"""
-        kind = (opt.get('url_kind') or '').lower()
+    def _ticket_of(opt):
+        """取出 resolve_ticket 线路里的票据；非该类型返回空串。"""
+        if (opt.get('url_kind') or '') != 'resolve_ticket':
+            return ''
         url = (opt.get('url') or '').strip()
-        scenario = opt.get('token_scenario') or ''
-        if scenario.startswith('series_intro'):
-            return 0
-        low = url.lower()
-        if low.startswith('http'):
-            if kind in ('m3u8', 'mp4', 'hls', 'flv') or '.m3u8' in low or '.mp4' in low:
-                return 3
-            return 2
-        if kind == 'resolve_ticket' or low.startswith('resolve://'):
-            return 1
-        return 0
+        if url.startswith('resolve://'):
+            return url[10:].strip()
+        if url and not url.startswith('http'):
+            return url
+        return ''
 
     def _resolve_ticket(self, ticket):
-        """ticket -> 真实播放地址。必须带 view=compact（该 query 参与签名），body 只传 ticket。"""
+        """ticket -> (真实播放地址, 是否需要登录)。
+        必须带 view=compact（该 query 参与签名），body 只传 ticket。"""
         if not ticket:
-            return ''
-        data = self._api_post('/v1/playback/resolve-line?view=compact', {'ticket': ticket})
-        if not isinstance(data, dict):
-            return ''
-        line = data.get('line') or {}
-        if not line and data.get('url'):
+            return '', False
+        path = '/v1/playback/resolve-line?view=compact'
+        headers = self._sign_headers('POST', path)
+        headers['Content-Type'] = 'application/json'
+        body = json.dumps({'ticket': ticket}, ensure_ascii=False).encode('utf-8')
+        try:
+            resp = self._fetch_post(self.site_url + path, headers, body)
+        except Exception:
+            return '', False
+        data = self._to_json(resp)
+        code = getattr(resp, 'status_code', 0)
+        biz = ''
+        if isinstance(data, dict):
+            biz = str(data.get('code') or '')
+        if code == 401 or biz.startswith('playback_user_session') or biz == 'login_required':
+            return '', True
+        line = (data or {}).get('line') if isinstance(data, dict) else None
+        if not line and isinstance(data, dict) and data.get('url'):
             line = data
-        if (line.get('token_scenario') or '').startswith('series_intro'):
-            return ''
-        url = (line.get('url') or '').strip()
-        return url if self._is_valid_video_url(url) else ''
+        if not isinstance(line, dict):
+            return '', False
+        real = (line.get('url') or '').strip()
+        if real and self._is_valid_video_url(real):
+            return real, False
+        return '', False
 
     def _probe_direct(self, url):
-        """轻量探活：True=可用，False=明确失败，None=无法判断（按可用处理）"""
+        """轻量探活：True=可用，False=明确失败，None=无法判断（按可用处理）。
+        只用于 m3u8 清单，避免把整部 mp4 拉下来。"""
+        if '.m3u8' not in (url or '').lower():
+            return None
         try:
             resp = self.fetch(url, headers={
                 'User-Agent': self.headers['User-Agent'],
                 'Referer': self.site_url + '/',
-            }, timeout=5000)
+            }, timeout=6000)
         except Exception:
             return None
         code = getattr(resp, 'status_code', None)
@@ -448,21 +640,15 @@ class Spider(Spider):
             if first_token:
                 resolve_data = self._api_get('/v1/playback/resolve/{0}'.format(first_token))
                 line_options = resolve_data.get('line_options', []) or []
-                seen_providers = set()
-                for opt in line_options:
-                    if not opt.get('url'):
-                        continue
-                    pid = opt.get('provider_id')
-                    if pid in seen_providers:
-                        continue
-                    seen_providers.add(pid)
-                    valid_lines.append(opt)
-
-                # 直链线路优先，需二次解析的 ticket 线路排后
-                valid_lines.sort(
-                    key=lambda x: (-self._line_rank(x), -int(x.get('preference_weight') or 0))
-                )
-                valid_lines = valid_lines[:12]
+                # 只保留 resolve_ticket 线路，按接口返回顺序，不去重、不截断
+                valid_lines = [opt for opt in line_options if self._ticket_of(opt)]
+                if not valid_lines and DIRECT_FALLBACK_WHEN_NO_TICKET:
+                    # 长尾片源只有第三方直链，没有官方线路；此时退回直链，否则整条记录无法播放
+                    valid_lines = [
+                        opt for opt in line_options
+                        if (opt.get('url') or '').startswith('http')
+                        and self._is_valid_video_url(opt.get('url'))
+                    ]
 
             if valid_lines:
                 used_names = set()
@@ -528,6 +714,10 @@ class Spider(Spider):
 
         # 1) 已经是直链媒体地址，直接交给播放器
         if token.startswith('http'):
+            low = token.lower()
+            if low.startswith(self.site_url) and ('/player/' in low or '/v1/' in low):
+                # 这是站点页面/接口地址，不是媒体流，交给外部解析
+                return {'parse': 1, 'url': token, 'header': play_header}
             if self._is_valid_video_url(token):
                 return {'parse': 0, 'url': token, 'header': play_header}
             return {'parse': 1, 'url': token, 'header': play_header}
@@ -565,47 +755,71 @@ class Spider(Spider):
                 return True
             return False
 
-        ordered = sorted(
-            line_options,
-            key=lambda x: (
-                not is_selected(x),
-                -self._line_rank(x),
-                -int(x.get('preference_weight') or 0),
-            ),
-        )
+        # 站点对部分内容要求登录：缓存已判定为受限的 token，避免每次播放都撞一串 401
+        gated = getattr(self, '_gated_tokens', None)
+        if gated is None:
+            gated = self._gated_tokens = set()
+        if token in gated:
+            return {'parse': 1, 'url': page_url(), 'header': play_header}
 
-        direct_cands = []
         ticket_cands = []
-        for line in ordered:
-            raw_url = (line.get('url') or '').strip()
-            if not raw_url:
-                continue
-            rank = self._line_rank(line)
-            if rank <= 0:
-                # 片头 / 无可用地址的线路，直接跳过，避免无谓的解析请求
-                continue
-            if raw_url.startswith('http') and rank >= 2 and self._is_valid_video_url(raw_url):
-                direct_cands.append(raw_url)
-                continue
-            if raw_url.startswith('resolve://'):
-                ticket_cands.append(raw_url[10:].strip())
-            elif line.get('url_kind') == 'resolve_ticket' and not raw_url.startswith('http'):
-                ticket_cands.append(raw_url)
+        for line in line_options:
+            ticket = self._ticket_of(line)
+            if ticket:
+                ticket_cands.append((line, ticket))
 
-        # 3.1 直链线路优先；有备选时做一次轻量探活，跳过上游已失效的地址
-        probe_budget = 2 if len(direct_cands) > 1 else 0
-        for url in direct_cands:
-            if probe_budget > 0:
-                probe_budget -= 1
-                if self._probe_direct(url) is False:
+        if ticket_cands:
+            # 有官方线路时只走官方线路，保持接口顺序，仅把「用户所选线路」提到最前
+            cands = ticket_cands
+            mode = 'ticket'
+        else:
+            # 长尾片源没有官方线路，退回直链，否则整条记录无法播放
+            if not DIRECT_FALLBACK_WHEN_NO_TICKET:
+                return {'parse': 1, 'url': page_url(), 'header': play_header}
+            mode = 'direct'
+            cands = []
+            for line in line_options:
+                url = (line.get('url') or '').strip()
+                if url.startswith('http') and self._is_valid_video_url(url):
+                    cands.append((line, url))
+        if not cands:
+            return {'parse': 1, 'url': page_url(), 'header': play_header}
+
+        cands.sort(key=lambda x: 0 if is_selected(x[0]) else 1)  # 稳定排序，其余仍是接口顺序
+
+        tried = 0
+        relogin_tried = False
+        for line, val in cands:
+            if mode == 'direct':
+                if tried >= 2:
+                    break
+                tried += 1
+                if tried < len(cands) and self._probe_direct(val) is False:
                     continue
-            return {'parse': 0, 'url': url, 'header': play_header}
+                return {'parse': 0, 'url': val, 'header': play_header}
 
-        # 3.2 票据线路，POST 换真实地址（最多尝试 3 条，避免无谓请求）
-        for ticket in ticket_cands[:3]:
-            real_url = self._resolve_ticket(ticket)
-            if real_url:
-                return {'parse': 0, 'url': real_url, 'header': play_header}
+            if tried >= 6:
+                break
+            tried += 1
+            real_url, need_login = self._resolve_ticket(val)
+            if need_login:
+                # 会话失效/未登录：有账号就先自动登录一次，再重试当前线路
+                if not relogin_tried and self._account and self._password and self._login():
+                    relogin_tried = True
+                    real_url, need_login = self._resolve_ticket(val)
+                    if real_url:
+                        return {'parse': 0, 'url': real_url, 'header': play_header}
+                    if not need_login:
+                        continue
+                # 官方线路占绝大多数，一条 401 基本可判定该集需要登录
+                gated.add(token)
+                break
+            if not real_url:
+                continue
+            # m3u8 清单做一次轻量探活，跳过已失效的 CDN；mp4 不探测，避免整片下载
+            if tried < len(cands) and self._probe_direct(real_url) is False:
+                continue
+            return {'parse': 0, 'url': real_url, 'header': play_header}
 
-        # 4) 全部线路都不可用（常见于需要登录的内容），退回站点播放页
+        # 4) 全部线路都不可用（需要登录 / 无票），退回站点播放页
         return {'parse': 1, 'url': page_url(), 'header': play_header}
