@@ -19,7 +19,7 @@
 在 TVBox / 影视仓 / OK影视 的订阅设置中填入：
 
 ```
-https://cdn.jsdelivr.net/gh/zxsla/pyjuhe@main/tvbox.json
+https://cdn.jsdelivr.net/gh/ylzt3126/pyjuhe@main/tvbox.json
 ```
 
 > 国内线路卡顿时可换 raw 地址：
