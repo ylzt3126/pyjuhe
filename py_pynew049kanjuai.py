@@ -69,6 +69,24 @@ CLIENT = {
 
 # 预置 cookie（抓包所得，含登录态 ai_movie_session）。
 # 仅作为 CookieJar 的初始值；登录成功后会被新会话覆盖并记录，不需要手工维护。
+#
+# 这 7 个 cookie 的真实来源（逐个抓包确认过，值都不来自登录响应体，而是 Set-Cookie 响应头
+# 或前端 JS 的 document.cookie）：
+#   ai_movie_session                  ← 登录接口的 Set-Cookie 响应头（HttpOnly，约 365 天）
+#                                       POST /v1/users/password/login 或 /v1/users/anonymous
+#                                       响应体只有 user/expires_at，会话票据只在这里出现
+#   ai_movie_browser=brw_xxx          ← 同一登录响应的 Set-Cookie（约 400 天，设备指纹）
+#   ai_movie_route_visitor=<32位hex>   ← 首次打开任意 HTML 页面时由前端网关(openresty)下发，30 天
+#   ai_movie_route_seen=1             ← 同上，1 天
+#   ai_movie_route_stay=1             ← 同上，1 天
+#   ai_movie_route_target=<域名>       ← 前端 route-transfer.js 写入，记录从哪个镜像域名(如 kanju48.com)跳转进来，30 天
+#   ai_movie_home_address_visited_v1  ← 前端 HomeAddressReminder 组件 document.cookie 写入的"已看过首页地址提醒"标记，365 天
+#
+# 实测权限只认 ai_movie_session：
+#   只带 ai_movie_session            -> resolve-line 201，拿到播放地址
+#   只带其余 6 个（无 session）        -> 401 playback_user_session_required
+#   完全不带 cookie                  -> 401 playback_user_session_required
+# 其余 6 个只为"看起来像真实浏览器"，不参与鉴权。
 COOKIE = (
     "ai_movie_home_address_visited_v1=1; "
     "ai_movie_browser=brw_-syhLxLb2T4Q6Yxb7oLl0VZyaSNcO-kl2sM0O-47Q3k; "
@@ -177,14 +195,18 @@ class Spider(Spider):
     def _record(self, why):
         """记录 cookie 值（内存留痕，便于排查；不落任何外部文件）"""
         ck = self._cookie_header()
-        self._ck_hist.append({
+        hist = getattr(self, "_ck_hist", None)
+        if not isinstance(hist, list):
+            hist = []
+            self._ck_hist = hist
+        hist.append({
             "t": int(time.time()),
             "why": why,
             "session": (self._jar or {}).get(SESSION_KEY, ""),
             "cookie": ck,
         })
-        if len(self._ck_hist) > 20:
-            self._ck_hist = self._ck_hist[-20:]
+        if len(hist) > 20:
+            del hist[:-20]
         _SESSION["jar"] = dict(self._jar)
         _SESSION["t"] = getattr(self, "_login_t", 0)
         _SESSION["user"] = getattr(self, "_user", {}) or {}
