@@ -23,7 +23,7 @@ https://cdn.jsdelivr.net/gh/zxsla/pyjuhe@main/tvbox.json
 ```
 
 > 国内线路卡顿时可换 raw 地址：
-> `https://raw.githubusercontent.com/zxsla/pyjuhe/main/tvbox.json`
+> `[https://raw.githubusercontent.com/zxsla/pyjuhe/main/tvbox.json](https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/refs/heads/main/tvbox.json)`
 
 ---
 
