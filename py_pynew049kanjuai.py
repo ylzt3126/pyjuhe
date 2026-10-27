@@ -94,7 +94,7 @@ COOKIE = (
     "ai_movie_route_seen=1; "
     "ai_movie_route_target=kanju48.com; "
     "ai_movie_route_stay=1; "
-    "ai_movie_session=ums_0nWUmsBsE7nYmqJkScZXlEbo27aEw_xtJSpeDz--26w"
+    "ai_movie_session=ums_NtLodi5Nn-wSgZuZnLQYtxb-ZnVx1ROjyqjyzEO76Rg"
 )
 
 # ---- 登录相关 ----
