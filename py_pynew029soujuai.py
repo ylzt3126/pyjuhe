@@ -32,7 +32,7 @@ DIRECT_FALLBACK_WHEN_NO_TICKET = True
 DEFAULT_ACCOUNT = 'souju3126'
 DEFAULT_PASSWORD = 'souju3126'
 DEFAULT_DEVICE_ID = 'brw_PrZeOSXqyokMJK1cpOYdFbP4DRJFlkTI6jbGvQFs6g4'
-DEFAULT_COOKIE = ('ai_movie_session=ums_xiVI7j5HyPdHgT-h1Uaxuw1mpIwu8sln3r4YwGxpEYM; '
+DEFAULT_COOKIE = ('ai_movie_session=ums_hptqvUfGsu50tHYc90nztL38MDC9ehmm8kTLySpRT-Q; '
                   'ai_movie_browser=' + DEFAULT_DEVICE_ID)
 
 
