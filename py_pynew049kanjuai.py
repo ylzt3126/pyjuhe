@@ -1,4 +1,34 @@
 # -*- coding: utf-8 -*-
+"""
+看剧 AI（kanju.ai）资源站 Spider —— 播放登录版
+
+一、为什么要登录（实测结论，2026-10 复现）
+  1) 首页 / 搜索 / 详情接口不带 cookie 也能正常返回；
+  2) 第 1 集是片头/预告线路，未登录也能播；
+  3) 从第 2 集起，POST /v1/playback/resolve-line 未登录时返回：
+         HTTP 401
+         {"statusCode":401,"code":"playback_user_session_required",
+          "state":"login_required","message":"该内容需要登录后播放"}
+     此时 line 为空，拿不到任何播放地址；
+  4) 带上含 ai_movie_session 的 cookie 后，同样请求返回 201 + 真实播放地址。
+
+二、登录接口（账号密码）
+     POST /v1/users/password/login
+     body: {"account": "<账号>", "password": "<密码>"}
+     -> 201 {"object":"user.session","user":{...},"expires_at":"...","identity":{...}}
+     -> Set-Cookie: ai_movie_session=ums_xxx; Max-Age=31535999; Domain=kanju.ai
+  备用（密码登录失败时）：POST /v1/users/anonymous  {}  -> 201，游客会话
+
+三、本文件的处理策略
+  * 所有请求头统一携带 cookie：预置 COOKIE + 运行时 CookieJar，自动吸收响应 Set-Cookie；
+  * 播放链路识别到 401 / login_required / *_session_required 时，
+    自动调用登录接口 → 记录新 cookie → 用新 cookie 重试同一请求（只重试一次，避免死循环）；
+  * cookie 每次变化都记录在 self._ck_hist 里（内存留痕，不写外部文件）；
+  * 线路解析跳过"占位图"线路（官方接口存在 url_kind=mp4 但地址是 .jpg 的情况）。
+
+所有逻辑均在本文件内实现，不引用任何外部文件。
+"""
+
 import sys
 import json
 import time
@@ -6,6 +36,8 @@ import hmac
 import hashlib
 import secrets
 import urllib.parse
+import urllib.request
+import urllib.error
 import math
 
 sys.path.append('..')
@@ -20,16 +52,43 @@ except ImportError:
             r.encoding = 'utf-8'
             return r
 
+try:
+    import requests as _rq
+except Exception:
+    _rq = None
+
 HOSTS = ["https://kanju.ai", "https://kanju20.com"]
 KEY = "557d0e4ae929f438da6bd84412374e6086b8af09b3fed54bf22601d5bf8c54a0"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-YJ = "https://zy.baipiaozhe.com/v1/playback/yjm3u8/%s.m3u8"
 CLIENT = {
     "x-ai-movie-client-name": "dianyingtiantang-frontend",
     "x-ai-movie-client-version": "1.0.0",
     "x-ai-movie-build-version": "dianyingtiantang-v2026.08.11.1-8cbb0b0d407e-672e67d62528",
     "x-ai-movie-protocol-version": "2026-07-05.library-v2.playback-v1",
 }
+
+# 预置 cookie（抓包所得，含登录态 ai_movie_session）。
+# 仅作为 CookieJar 的初始值；登录成功后会被新会话覆盖并记录，不需要手工维护。
+COOKIE = (
+    "ai_movie_home_address_visited_v1=1; "
+    "ai_movie_browser=brw_-syhLxLb2T4Q6Yxb7oLl0VZyaSNcO-kl2sM0O-47Q3k; "
+    "ai_movie_route_visitor=52f0efcb699c8d5021824e0efbbc2df0; "
+    "ai_movie_route_seen=1; "
+    "ai_movie_route_target=kanju48.com; "
+    "ai_movie_route_stay=1; "
+    "ai_movie_session=ums_0nWUmsBsE7nYmqJkScZXlEbo27aEw_xtJSpeDz--26w"
+)
+
+# ---- 登录相关 ----
+ACCOUNT = "kanju3126"                       # 账号
+PASSWORD = "kanju3126"                      # 密码
+LOGIN_PATH = "/v1/users/password/login"     # 密码登录接口
+GUEST_PATH = "/v1/users/anonymous"          # 游客登录（备用）
+SESSION_KEY = "ai_movie_session"            # 会话 cookie 名
+LOGIN_FLAGS = ("login_required", "session_required", "需要登录", "请先登录")
+LOGIN_TTL = 3600                            # 登录成功后 1 小时内不重复登录
+# 同一进程内跨实例共享会话，避免每次重建实例都重新登录
+_SESSION = {}
 
 CATEGORIES = {
     "movie": "电影", "series": "电视剧", "short_drama": "短剧",
@@ -45,12 +104,54 @@ GENRES = {
     "documentary": ["历史", "纪录片"],
 }
 
+IMG_KIND = ("image", "img", "jpg", "jpeg", "png", "poster", "cover", "screenshot")
+
+
+def _ck_parse(s):
+    """'a=1; b=2' -> {'a':'1','b':'2'}（保序、丢弃空值）"""
+    d = {}
+    for part in str(s or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k and v:
+            d[k] = v
+    return d
+
+
+def _ck_join(d):
+    return "; ".join("%s=%s" % (k, v) for k, v in (d or {}).items() if v)
+
+
+def _is_img(url, line=None):
+    """
+    只依据接口显式声明的 url_kind 判断图片线路。
+    注意：byteimg/heycan 的直链路径形如 xxx.jpg~tplv-xxx-image.image，
+    但返回体其实是 MP4（实测 206 + ftypisom），所以绝不能用扩展名或
+    token_scenario（第 1 集全部线路都会带 series_intro_zero）来过滤。
+    """
+    line = line or {}
+    kind = str(line.get("url_kind") or line.get("kind") or "").lower()
+    return kind in IMG_KIND
+
 
 class Spider(Spider):
     def init(self, extend=""):
+        # ---- CookieJar：预置 cookie + 跨实例缓存 + 响应 Set-Cookie ----
+        self._jar = _ck_parse(COOKIE)
+        for k, v in (_SESSION.get("jar") or {}).items():
+            self._jar[k] = v
+        self._ck_hist = []          # 记录用：cookie 每次变化留痕
+        self._login_t = _SESSION.get("t", 0)
+        self._user = _SESSION.get("user", {}) or {}
+        self._valid = bool(_SESSION.get("valid"))   # 会话是否已被服务端验证过
+        self._record("seed")
+
         for i, h in enumerate(HOSTS):
             try:
-                r = self.fetch(h, headers={"User-Agent": UA}, timeout=15000)
+                r = self.fetch(h, headers={"User-Agent": UA, "Cookie": self._cookie_header()}, timeout=15000)
                 if getattr(r, 'status_code', None) == 200:
                     self._hi = i
                     break
@@ -58,8 +159,76 @@ class Spider(Spider):
                 continue
         else:
             self._hi = 0
+
+        # 没有会话就登录（优先账号密码）
+        if not self._has_session():
+            self._login(force=True)
         return ""
 
+    # ------------------------------------------------------------------ #
+    # cookie 管理
+    # ------------------------------------------------------------------ #
+    def _has_session(self):
+        return bool((self._jar or {}).get(SESSION_KEY))
+
+    def _cookie_header(self):
+        return _ck_join(self._jar)
+
+    def _record(self, why):
+        """记录 cookie 值（内存留痕，便于排查；不落任何外部文件）"""
+        ck = self._cookie_header()
+        self._ck_hist.append({
+            "t": int(time.time()),
+            "why": why,
+            "session": (self._jar or {}).get(SESSION_KEY, ""),
+            "cookie": ck,
+        })
+        if len(self._ck_hist) > 20:
+            self._ck_hist = self._ck_hist[-20:]
+        _SESSION["jar"] = dict(self._jar)
+        _SESSION["t"] = getattr(self, "_login_t", 0)
+        _SESSION["user"] = getattr(self, "_user", {}) or {}
+        return ck
+
+    def cookieDump(self):
+        """调试用：查看当前 cookie 与变化记录"""
+        return {"current": self._cookie_header(), "history": list(self._ck_hist), "user": self._user}
+
+    def _absorb(self, headers):
+        """吸收响应 Set-Cookie（兼容 requests 的 CaseInsensitiveDict 与 (k,v) 列表）"""
+        if not headers:
+            return False
+        try:
+            items = list(headers.items() if hasattr(headers, "items") else headers)
+        except Exception:
+            return False
+        changed = False
+        for k, v in items:
+            if str(k).lower() != "set-cookie":
+                continue
+            ck = str(v or "")
+            kv = ck.split(";")[0]
+            if "=" not in kv:
+                continue
+            name, val = kv.split("=", 1)
+            name, val = name.strip(), val.strip()
+            if not name:
+                continue
+            low = ck.lower()
+            dead = (not val) or ("max-age=0" in low) or ("1970" in low and "expires" in low)
+            if dead:
+                if self._jar.pop(name, None) is not None:
+                    changed = True
+            elif self._jar.get(name) != val:
+                self._jar[name] = val
+                changed = True
+        if changed:
+            self._record("set-cookie")
+        return changed
+
+    # ------------------------------------------------------------------ #
+    # 基础请求
+    # ------------------------------------------------------------------ #
     def _host(self):
         return HOSTS[getattr(self, '_hi', 0)]
 
@@ -70,32 +239,165 @@ class Spider(Spider):
         sig = hmac.new(KEY.encode(), msg.encode(), hashlib.sha256).hexdigest()
         return ts, nonce, sig
 
-    def _req(self, method, path, body=None):
-        for _ in range(len(HOSTS)):
-            host = self._host()
+    def _http(self, method, url, headers, body=None, timeout=10):
+        """返回 (code, text, headers)；requests 缺失时回退 urllib"""
+        if _rq is not None:
+            if body is not None:
+                r = _rq.post(url, json=body, headers=headers, timeout=timeout)
+            else:
+                r = _rq.get(url, headers=headers, timeout=timeout)
+            return r.status_code, (r.text or ""), r.headers
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+        rq = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(rq, timeout=timeout) as r:
+                return r.status, r.read().decode("utf-8", "ignore"), r.headers
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "ignore"), e.headers
+
+    def _raw(self, method, path, body=None, host=None, cookie=None, timeout=10):
+        """基础请求。cookie=None 用 CookieJar，cookie='' 表示不带 cookie。"""
+        host = host or self._host()
+        ts, nonce, sig = self._sign(method, path)
+        hdrs = {
+            "User-Agent": UA, "Accept": "application/json",
+            "Referer": host + "/", "Origin": host,
+            "x-ai-movie-timestamp": ts, "x-ai-movie-nonce": nonce,
+            "x-ai-movie-signature": sig,
+        }
+        hdrs.update(CLIENT)
+        ck = self._cookie_header() if cookie is None else cookie
+        if ck:
+            hdrs["Cookie"] = ck
+        if body is not None:
+            hdrs["Content-Type"] = "application/json"
+        code, text, h = self._http(method, host + path, hdrs, body, timeout)
+        self._absorb(h)
+        return code, text, h
+
+    def _login_required(self, code, text):
+        """根据返回结果判断是否需要登录（不登录播放会返回 401 + state=login_required）"""
+        s = str(text or "").lower()
+        if "playback_user_session_required" in s or "user_session_required" in s:
+            return True
+        for f in LOGIN_FLAGS:
+            if f in s:
+                return True
+        return code in (401, 419)
+
+    # ------------------------------------------------------------------ #
+    # 登录
+    # ------------------------------------------------------------------ #
+    def _login(self, force=False):
+        """账号密码登录；失败则退回游客登录。成功返回 True。"""
+        now = time.time()
+        # 只有"本进程内刚登录成功且会话已生效"才跳过，预置 cookie 一律视为未验证
+        if (not force) and self._valid and self._has_session() \
+                and (now - getattr(self, "_login_t", 0)) < LOGIN_TTL:
+            return True
+
+        ok = False
+        # 1) 账号密码登录（不需要旧会话）
+        if ACCOUNT and PASSWORD:
             try:
-                ts, nonce, sig = self._sign(method, path)
-                hdrs = {
-                    "User-Agent": UA, "Accept": "application/json",
-                    "Referer": host + "/",
-                    "x-ai-movie-timestamp": ts, "x-ai-movie-nonce": nonce,
-                    "x-ai-movie-signature": sig,
-                }
-                hdrs.update(CLIENT)
-                import requests as rq
-                if body is not None:
-                    hdrs["Content-Type"] = "application/json"
-                    r = rq.post(host + path, json=body, headers=hdrs, timeout=10)
-                else:
-                    r = rq.get(host + path, headers=hdrs, timeout=10)
-                if r.status_code in (200, 201):
-                    return r.json()
+                code, txt, _ = self._raw("POST", LOGIN_PATH,
+                                         {"account": ACCOUNT, "password": PASSWORD},
+                                         cookie="", timeout=12)
             except Exception:
-                pass
+                code, txt = 0, ""
+            if code in (200, 201):
+                try:
+                    j = json.loads(txt)
+                except Exception:
+                    j = {}
+                if isinstance(j, dict):
+                    self._user = {
+                        "user_id": ((j.get("user") or {}).get("id") or ""),
+                        "display_name": ((j.get("user") or {}).get("display_name") or ""),
+                        "expires_at": j.get("expires_at") or "",
+                        "identity": j.get("identity") or {},
+                    }
+                ok = self._has_session()
+                if ok:
+                    self._record("password-login")
+
+        # 2) 游客登录兜底
+        if not ok:
+            try:
+                code, txt, _ = self._raw("POST", GUEST_PATH, {}, cookie="", timeout=12)
+            except Exception:
+                code, txt = 0, ""
+            if code in (200, 201):
+                try:
+                    j = json.loads(txt)
+                except Exception:
+                    j = {}
+                if not self._has_session() and isinstance(j, dict):
+                    for k in ("session", "session_id", "token"):
+                        v = j.get(k) or ""
+                        if v:
+                            self._jar[SESSION_KEY] = v
+                            break
+                ok = self._has_session()
+                if ok:
+                    self._user = {"user_id": ((j.get("user") or {}).get("id") or ""),
+                                  "display_name": ((j.get("user") or {}).get("display_name") or ""),
+                                  "identity": j.get("identity") or {"provider": "anonymous"}}
+                    self._record("guest-login")
+
+        if ok:
+            self._login_t = now
+            self._valid = True
+            _SESSION["t"] = now
+            _SESSION["valid"] = True
+            _SESSION["jar"] = dict(self._jar)
+            _SESSION["user"] = self._user or {}
+        return ok
+
+    def _api(self, method, path, body=None, retry=True):
+        """带登录自愈的 API 调用，返回 (code, dict)"""
+        host = self._host()
+        try:
+            code, txt, _ = self._raw(method, path, body, host=host)
+        except Exception:
+            return 0, {}
+        if self._login_required(code, txt) and retry:
+            # 被拒说明当前会话不可信：先置无效，避免 _login 里的 TTL 短路
+            self._valid = False
+            _SESSION["valid"] = False
+            if self._login():
+                try:
+                    code, txt, _ = self._raw(method, path, body, host=host)
+                except Exception:
+                    return 0, {}
+                if self._login_required(code, txt):
+                    self._valid = False      # 登录后仍拒，下次继续重新登录
+        if code in (200, 201):
+            self._valid = True
+            _SESSION["valid"] = True
+        try:
+            j = json.loads(txt) if txt else {}
+        except Exception:
+            j = {}
+        return code, (j if isinstance(j, dict) else {})
+
+    def _req(self, method, path, body=None):
+        """兼容旧行为：轮换 host，只返回 dict"""
+        for _ in range(len(HOSTS)):
+            code, j = self._api(method, path, body)
+            if code in (200, 201) and j:
+                return j
+            if code in (401, 419):
+                break       # 已尝试登录仍失败，别再切域名空转
             self._hi = (self._hi + 1) % len(HOSTS)
             time.sleep(1)
         return {}
 
+    # ------------------------------------------------------------------ #
+    # 数据映射
+    # ------------------------------------------------------------------ #
     def _vod(self, c):
         return {
             "vod_id": c.get("id", ""),
@@ -178,9 +480,14 @@ class Spider(Spider):
         if eps and urls:
             tok0 = eps[0].get("token")
             if tok0:
-                rj = self._req("GET", "/v1/playback/resolve/%s" % tok0)
-                names = [(l.get("provider_name") or "") for l in (rj.get("line_options") or [])]
-                names = [n for n in names if n][:8]
+                _, rj = self._api("GET", "/v1/playback/resolve/%s" % tok0)
+                names, seen = [], set()
+                for l in (rj.get("line_options") or []):
+                    n = (l.get("provider_name") or "").strip()
+                    if n and n not in seen:
+                        seen.add(n)
+                        names.append(n)
+                names = names[:8]
                 if names:
                     play_from = "$$$".join(names)
                     play_url = "$$$".join([play_url] * len(names))
@@ -210,45 +517,135 @@ class Spider(Spider):
         self._sc[ck], self._sc_t[ck] = r, now
         return r
 
+    # ------------------------------------------------------------------ #
+    # 播放
+    # ------------------------------------------------------------------ #
+    def _ticket(self, lo):
+        t = str(lo.get("url") or lo.get("ticket") or "").strip()
+        if t.startswith("resolve://"):
+            t = t[10:]
+        return t
+
+    def _rank(self, lines, wanted):
+        """
+        线路排序（剔除占位图）：
+          flag 命中优先 → selected → default_priority → 其余
+        """
+        picked, rest = [], []
+        for lo in (lines or []):
+            if not self._ticket(lo):
+                continue
+            name = (lo.get("provider_name") or "").strip()
+            if wanted and wanted not in ("kanju", "") and name == wanted:
+                picked.append(lo)
+            else:
+                rest.append(lo)
+        rest.sort(key=lambda x: (
+            0 if x.get("selected") else 1,
+            0 if x.get("default_priority") else 1,
+            0 if str(x.get("url_kind") or "").lower() in ("mp4", "m3u8") else 1,
+        ))
+        return picked + rest
+
     def playerContent(self, flag, id, vipFlags=None, vipIds=None):
         tok = str(id or "").strip()
         if not tok:
             return {"url": ""}
-        murl = YJ % tok
-        try:
-            import requests as rq
-            r = rq.get(murl, headers={"User-Agent": UA}, timeout=6)
-            if r.status_code == 200 and "#EXTM3U" in r.text:
-                return {"parse": 0, "url": murl}
-        except Exception:
-            pass
-        try:
-            import requests as rq
-            r = rq.get("https://zy.baipiaozhe.com/v1/playback/yjapi/%s" % tok, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=6)
-            if r.status_code == 200:
-                j = r.json()
-                u = (j.get("url") or "") if isinstance(j, dict) else ""
-                if u:
-                    return {"parse": 0, "url": u}
-        except Exception:
-            pass
-        j = self._req("GET", "/v1/playback/resolve/%s" % tok)
-        lines = j.get("line_options") or []
-        wanted = str(flag or "")
-        if wanted and wanted != "kanju":
-            picked = [l for l in lines if (l.get("provider_name") or "") == wanted]
-            lines = picked or lines
-        for lo in lines:
-            t = lo.get("url") or ""
-            if t.startswith("resolve://"):
-                t = t[10:]
-            if not t:
+        wanted = str(flag or "").strip()
+
+        code, rj = self._api("GET", "/v1/playback/resolve/%s" % tok)
+        lines = rj.get("line_options") or []
+
+        # 少见情况：resolve 直接给地址
+        direct = str(rj.get("url") or "")
+        if not lines and direct:
+            return self._ret(direct)
+
+        forced = False
+        fallback = ""          # 探测不通但接口给了地址时，兜底返回
+        for lo in self._rank(lines, wanted)[:8]:
+            t = self._ticket(lo)
+            c, line = self._api("POST", "/v1/playback/resolve-line", {"ticket": t})
+            url = self._line_url(line)
+            if not url and c in (401, 419) and not forced:
+                # 会话被顶号/失效 → 强制重新登录一次再试
+                forced = True
+                if self._login(force=True):
+                    c, line = self._api("POST", "/v1/playback/resolve-line", {"ticket": t})
+                    url = self._line_url(line)
+            if not url:
                 continue
-            rj = self._req("POST", "/v1/playback/resolve-line", {"ticket": t})
-            url = (rj.get("line") or {}).get("url") or ""
-            if url:
-                return {"parse": 0, "url": url}
+            meta = (line.get("line") or {}) if isinstance(line, dict) else {}
+            if _is_img(url, meta):
+                continue
+            if not fallback:
+                fallback = url
+            ok = self._probe(url)
+            if ok != 0:                     # 1=确认可播，-1=探测受限（SSL/超时）也放行
+                return self._ret(url)
+        if fallback:
+            return self._ret(fallback)
         return {"url": ""}
+
+    def _line_url(self, line):
+        if not isinstance(line, dict):
+            return ""
+        return str((line.get("line") or {}).get("url") or "")
+
+    def _probe(self, url):
+        """
+        探测直链是否真的能播：1 可播 / 0 明确不可播 / -1 无法判断
+        只看内容魔数（ftyp / #EXTM3U），不看 Content-Type —— 官方 CDN 会把
+        MP4 标成 image/jpeg，也会用 .jpg~tplv 之类的路径。
+        """
+        u = str(url or "")
+        if not u.startswith("http"):
+            return 0
+        is_m3u8 = ".m3u8" in u.lower()
+        hdrs = {"User-Agent": UA, "Referer": self._host() + "/", "Accept": "*/*"}
+        if not is_m3u8:
+            hdrs["Range"] = "bytes=0-2047"
+        code, body = 0, b""
+        try:
+            if _rq is not None:
+                r = _rq.get(u, headers=hdrs, timeout=7, stream=True)
+                code = r.status_code
+                try:
+                    body = r.raw.read(4096) or b""
+                except Exception:
+                    body = b""
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            else:
+                rq = urllib.request.Request(u, headers=hdrs)
+                try:
+                    with urllib.request.urlopen(rq, timeout=7) as r:
+                        code = r.status
+                        body = r.read(4096)
+                except urllib.error.HTTPError as e:
+                    code = e.code
+        except Exception:
+            return -1
+        if code in (403, 404, 410, 451):
+            return 0
+        if code not in (200, 206):
+            return -1
+        if is_m3u8:
+            return 1 if b"#EXTM3U" in body else 0
+        if b"ftyp" in body or b"#EXTM3U" in body or b"ID3" in body[:32]:
+            return 1
+        return 0
+
+    def _ret(self, url):
+        u = str(url)
+        hdrs = {"User-Agent": UA, "Referer": self._host() + "/"}
+        low = u.lower().split("?")[0]
+        if ".m3u8" in low:
+            hdrs["Accept"] = "*/*"
+            hdrs["Origin"] = self._host()
+        return {"parse": 0, "url": u, "header": hdrs}
 
     def localProxy(self, param):
         return None
