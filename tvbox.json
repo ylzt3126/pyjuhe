@@ -530,6 +530,18 @@
       "type": 3,
       "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_feiniuyingshi.py"
     },
+	{
+      "key": "py_dmhyy",
+      "name": "🎬影视｜大马猴影视",
+      "type": 3,
+      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_dmhyy.py"
+    },
+	{
+      "key": "py_fkankanya",
+      "name": "🎬影视｜看看鸭",
+      "type": 3,
+      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_kankanya.py"
+    },
     {
       "key": "py_99duanjuwang",
       "name": "📱短剧｜99短剧网",
