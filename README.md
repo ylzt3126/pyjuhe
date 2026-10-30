@@ -41,11 +41,7 @@ https://cdn.jsdelivr.net/gh/ylzt3126/pyjuhe@main/tvbox.json
 ---
 
 ## 🧹 筛选标准
-
-- ✅ 每个源都经过存活测试，死站已剔除
-- ✅ 18+ / 成人 / 擦边内容全部剔除
-- ✅ 重复源已去重
-- ✅ 文件名采用站点拼音命名，一看就知道是哪个站
+https://github.com/zxsla/pyjuhe
 
 ---
 
