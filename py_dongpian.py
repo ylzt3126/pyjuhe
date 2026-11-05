@@ -72,7 +72,8 @@ __all__ = [
 # 站点常量（可通过 init(extend) 覆盖）
 # --------------------------------------------------------------------------- #
 
-_DEFAULT_HOST = "https://dongpian.ai"
+# _DEFAULT_HOST = "https://dongpian.ai"
+_DEFAULT_HOST = "https://dongpian25.com"
 _DEFAULT_SIGN_KEY = "8b9a908a05eac640e1ee06f52acaa741bfe4ba9e004eeffdbeb635e532e06666"
 _DEFAULT_BUILD_VERSION = "dongpiandi-v2026.11.02.1-player-pause-gateway-464465fce4f1-web"
 _CLIENT_NAME = "movie-search-frontend"
