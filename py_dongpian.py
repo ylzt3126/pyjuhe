@@ -36,9 +36,11 @@ playerContent    {"parse": 0, "play": "", "url": "...", "header": {...}, ...}
 
 初始化与播放优选
 ----------------
-1. 初始化阶段调用 /v1/users/password/login（账号与密码均使用 dongpian3126，
-   可通过 init({"account": ..., "password": ...}) 覆盖），保存响应返回的
-   Set-Cookie，并在之后所有接口请求头中统一携带该 Cookie；票据解析依赖此会话。
+1. 初始化阶段调用 /v1/users/password/login 建立会话：默认账号池共 10 个
+   （现有账号 + dongpianai01..dongpianai09，密码与账号同名），每次登录随机
+   取一个，失败自动换账号重试；可用 init({"account", "password"}) 固定单账号，
+   或 init({"accounts": [...]}) 自定义账号池。保存响应返回的 Set-Cookie，
+   并在之后所有接口请求头中统一携带该 Cookie；票据解析依赖此会话。
 2. 线路优选：优先识别 url_kind == "resolve_ticket" 的视频源。存在这类源时，
    只保留并展示它们、过滤其余源，播放时通过
    POST /v1/playback/resolve-line?view=compact 二次解析换取真实可播地址；
@@ -87,6 +89,13 @@ _DEFAULT_PASSWORD = "dongpian3126"
 _LOGIN_PATH = "/v1/users/password/login"
 _RESOLVE_LINE_PATH = "/v1/playback/resolve-line?view=compact"
 _LOGIN_RETRY_INTERVAL = 60.0
+_LOGIN_ACCOUNT_ATTEMPTS = 3
+
+# 默认账号池：现有 1 个 + dongpianai01..dongpianai09，共 10 个，密码与账号同名
+_ACCOUNT_POOL = tuple(
+    [(_DEFAULT_ACCOUNT, _DEFAULT_PASSWORD)]
+    + [("dongpianai%02d" % i,) * 2 for i in range(1, 10)]
+)
 
 # 进程内共享缓存：跨 Spider 实例复用静态配置与首页快照，按 host 隔离；不写磁盘
 _SHARED_CACHE = {}          # type: Dict[str, Tuple[Any, float]]
@@ -185,6 +194,26 @@ def _positive(value: Any, default: int, ceiling: int = 100) -> int:
     if n < 1:
         n = default
     return min(n, ceiling)
+
+
+def _normalize_accounts(value: Any) -> Tuple[Tuple[str, str], ...]:
+    """把 list/tuple/dict/字符串形式的账号配置规范化为 ((账号, 密码), ...)。"""
+    if not isinstance(value, (list, tuple)):
+        return ()
+    out = []
+    for item in value:
+        account, password = "", ""
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            account, password = _text(item[0]), _text(item[1])
+        elif isinstance(item, dict):
+            account = _text(item.get("account") or item.get("username"))
+            password = _text(item.get("password")) or account
+        elif isinstance(item, str):
+            account = _text(item)
+            password = account
+        if account and password and (account, password) not in out:
+            out.append((account, password))
+    return tuple(out)
 
 
 def _first(*values: Any) -> str:
@@ -323,14 +352,19 @@ def _empty_player(flag: str = "", vid: str = "") -> Dict[str, Any]:
 class _Http(object):
     def __init__(self, host: str, key: str, build_version: str,
                  timeout: float, retries: int,
-                 account: str = "", password: str = "") -> None:
+                 account: str = "", password: str = "",
+                 accounts: Any = None) -> None:
         self.host = (host or _DEFAULT_HOST).rstrip("/")
         self.key = key or _DEFAULT_SIGN_KEY
         self.build_version = build_version or _DEFAULT_BUILD_VERSION
         self.timeout = float(timeout) if timeout and float(timeout) > 0 else 12.0
         self.retries = max(0, min(3, _int(retries, 1)))
-        self.account = account or _DEFAULT_ACCOUNT
-        self.password = password or _DEFAULT_PASSWORD
+        explicit_account = _text(account)
+        explicit_password = _text(password)
+        if explicit_account and explicit_password:
+            self.accounts = ((explicit_account, explicit_password),)
+        else:
+            self.accounts = _normalize_accounts(accounts) or _ACCOUNT_POOL
         # 登录返回的 cookie 统一保存在这里，并由 _base_headers 注入每次请求头
         self._cookie_map = {}    # type: Dict[str, str]
         self._auth_cookie = ""
@@ -378,7 +412,7 @@ class _Http(object):
                 )
 
     def ensure_login(self, force: bool = False) -> bool:
-        """初始化阶段登录；失败后一段时间内不重复尝试，绝不抛异常。"""
+        """从账号池随机取一个登录；失败自动换账号重试，绝不抛异常。"""
         with self._login_lock:
             if self._login_state == 1 and self._auth_cookie:
                 return True
@@ -386,15 +420,24 @@ class _Http(object):
             if not force and now - self._login_at < _LOGIN_RETRY_INTERVAL:
                 return False
             self._login_at = now
+        order = list(self.accounts or _ACCOUNT_POOL)
         try:
-            obj, status = self.request(
-                "POST", _LOGIN_PATH,
-                body={"account": self.account, "password": self.password},
-                need_auth=False, timeout=min(self.timeout, 8.0),
-            )
-            ok = status in (200, 201) and bool(obj) and bool(self._auth_cookie)
+            secrets.SystemRandom().shuffle(order)
         except Exception:
-            ok = False
+            pass
+        ok = False
+        for account, password in order[:_LOGIN_ACCOUNT_ATTEMPTS]:
+            try:
+                obj, status = self.request(
+                    "POST", _LOGIN_PATH,
+                    body={"account": account, "password": password},
+                    need_auth=False, timeout=min(self.timeout, 8.0),
+                )
+                if status in (200, 201) and obj and self._auth_cookie:
+                    ok = True
+                    break
+            except Exception:
+                continue
         with self._login_lock:
             self._login_state = 1 if ok else -1
         return ok
@@ -598,8 +641,9 @@ class Spider(object):
         self._timeout = 12.0
         self._retries = 1
         self._page_size = 20
-        self._account = _DEFAULT_ACCOUNT
-        self._password = _DEFAULT_PASSWORD
+        self._account = ""
+        self._password = ""
+        self._accounts = _ACCOUNT_POOL
         self._cfg = self._config_snapshot()
         self._http = self._new_http()
         self._meta = {}          # vod_id -> 列表卡片原始信息（补全详情缺失字段）
@@ -618,12 +662,13 @@ class Spider(object):
             "retries": self._retries,
             "account": self._account,
             "password": self._password,
+            "accounts": self._accounts,
         }
 
     def _new_http(self) -> _Http:
         return _Http(self._host, self._key, self._build_version,
                      self._timeout, self._retries,
-                     self._account, self._password)
+                     self._account, self._password, self._accounts)
 
     # -- 生命周期 ------------------------------------------------------------ #
 
@@ -648,9 +693,9 @@ class Spider(object):
         self._timeout = float(_text(ext.get("timeout"), "12") or "12")
         self._retries = _int(ext.get("retries"), 1)
         self._page_size = _positive(ext.get("page_size"), 20, 50)
-        self._account = _text(ext.get("account") or ext.get("username"),
-                              _DEFAULT_ACCOUNT) or _DEFAULT_ACCOUNT
-        self._password = _text(ext.get("password"), _DEFAULT_PASSWORD) or _DEFAULT_PASSWORD
+        self._account = _text(ext.get("account") or ext.get("username"))
+        self._password = _text(ext.get("password")) or self._account
+        self._accounts = _normalize_accounts(ext.get("accounts")) or _ACCOUNT_POOL
         new_cfg = self._config_snapshot()
         # 配置未变时复用既有会话与已预热缓存，避免重复登录和重新拉取首页
         previous = getattr(self, "_cfg", None)
