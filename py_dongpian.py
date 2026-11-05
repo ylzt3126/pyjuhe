@@ -57,6 +57,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_tz
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -86,6 +87,10 @@ _DEFAULT_PASSWORD = "dongpian3126"
 _LOGIN_PATH = "/v1/users/password/login"
 _RESOLVE_LINE_PATH = "/v1/playback/resolve-line?view=compact"
 _LOGIN_RETRY_INTERVAL = 60.0
+
+# 进程内共享缓存：跨 Spider 实例复用静态配置与首页快照，按 host 隔离；不写磁盘
+_SHARED_CACHE = {}          # type: Dict[str, Tuple[Any, float]]
+_SHARED_CACHE_LOCK = threading.RLock()
 
 _KIND_LABELS = {
     "movie": "电影",
@@ -336,7 +341,8 @@ class _Http(object):
         self._opener = urllib.request.build_opener()
         self._clock_offset = 0.0
         self._lock = threading.RLock()
-        self._cache = {}  # type: Dict[str, Tuple[Any, float]]
+        self._cache = _SHARED_CACHE
+        self._cache_lock = _SHARED_CACHE_LOCK
 
     # -- 登录与会话 cookie ---------------------------------------------------- #
 
@@ -393,9 +399,13 @@ class _Http(object):
             self._login_state = 1 if ok else -1
         return ok
 
+    @staticmethod
+    def _cache_key(key: str, host: str) -> str:
+        return host + "|" + key
+
     def invalidate(self, key: str) -> None:
-        with self._lock:
-            self._cache.pop(key, None)
+        with self._cache_lock:
+            self._cache.pop(self._cache_key(key, self.host), None)
 
     # -- 时钟 ---------------------------------------------------------------- #
 
@@ -554,8 +564,9 @@ class _Http(object):
 
     def cached(self, key: str, ttl: float, producer) -> Any:
         now = time.time()
-        with self._lock:
-            hit = self._cache.get(key)
+        cache_key = self._cache_key(key, self.host)
+        with self._cache_lock:
+            hit = self._cache.get(cache_key)
             if hit and hit[1] > now:
                 return hit[0]
         try:
@@ -566,11 +577,11 @@ class _Http(object):
             value = {}
         # 空/失败结果只做极短缓存，避免故障期间长时间不可用
         effective = ttl if value else min(ttl, 8.0)
-        with self._lock:
+        with self._cache_lock:
             if len(self._cache) > 256:
                 for k in [k for k, v in self._cache.items() if v[1] <= now]:
                     self._cache.pop(k, None)
-            self._cache[key] = (value, now + effective)
+            self._cache[cache_key] = (value, now + effective)
         return value
 
 
@@ -589,6 +600,7 @@ class Spider(object):
         self._page_size = 20
         self._account = _DEFAULT_ACCOUNT
         self._password = _DEFAULT_PASSWORD
+        self._cfg = self._config_snapshot()
         self._http = self._new_http()
         self._meta = {}          # vod_id -> 列表卡片原始信息（补全详情缺失字段）
         self._meta_lock = threading.RLock()
@@ -596,6 +608,17 @@ class Spider(object):
         self._http.ensure_login(force=True)
         if extend is not None:
             self.init(extend)
+
+    def _config_snapshot(self) -> Dict[str, Any]:
+        return {
+            "host": self._host,
+            "key": self._key,
+            "build_version": self._build_version,
+            "timeout": self._timeout,
+            "retries": self._retries,
+            "account": self._account,
+            "password": self._password,
+        }
 
     def _new_http(self) -> _Http:
         return _Http(self._host, self._key, self._build_version,
@@ -628,6 +651,13 @@ class Spider(object):
         self._account = _text(ext.get("account") or ext.get("username"),
                               _DEFAULT_ACCOUNT) or _DEFAULT_ACCOUNT
         self._password = _text(ext.get("password"), _DEFAULT_PASSWORD) or _DEFAULT_PASSWORD
+        new_cfg = self._config_snapshot()
+        # 配置未变时复用既有会话与已预热缓存，避免重复登录和重新拉取首页
+        previous = getattr(self, "_cfg", None)
+        if new_cfg == previous and getattr(self, "_http", None) is not None:
+            self._cfg = new_cfg
+            return ""
+        self._cfg = new_cfg
         self._http = self._new_http()
         self._http.ensure_login(force=True)
         return ""
@@ -769,7 +799,7 @@ class Spider(object):
                 "scope": "public", "mode": "preview", "sections": 3, "cards": 10,
             })
             return obj
-        result = self._http.cached("home.feed", 120.0, load)
+        result = self._http.cached("home.feed", 300.0, load)
         return result if isinstance(result, dict) else {}
 
     def _home_vods(self) -> List[Dict[str, Any]]:
@@ -780,6 +810,12 @@ class Spider(object):
 
     def homeContent(self, filter: Any = False) -> Dict[str, Any]:
         try:
+            # 运行时配置与首页快照互不依赖，并行预热以缩短冷启动
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                boot = pool.submit(self._bootstrap)
+                feed = pool.submit(self._home_feed)
+                boot.result()
+                feed.result()
             return {
                 "class": self._categories(),
                 "filters": self._filters(),
