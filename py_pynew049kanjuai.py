@@ -551,20 +551,12 @@ class Spider(Spider):
         self._bs, self._bs_t = j, now
         return j
 
-    def _categories_from(self, boot):
-        """站点下发的分类标签（channels），没有就退回内置 CATEGORIES"""
-        out, seen = [], set()
-        ui = _as_dict(_as_dict(boot).get("catalog_ui"))
-        for chan in _as_list(ui.get("channels")):
-            c = _as_dict(chan)
-            tid = _text(c.get("key"))
-            if not tid or tid in seen:
-                continue
-            seen.add(tid)
-            out.append({"type_id": tid, "type_name": _first(c.get("label"), tid)})
-        if out:
-            return out
-        return [{"type_id": k, "type_name": v} for k, v in CATEGORIES.items()]
+    def _class_list(self):
+        """分类标签：沿用本文件原有的 CATEGORIES + GENRES（subs 二级分类）方式"""
+        return [{"type_id": k, "type_name": v,
+                 "subs": [{"type_id": "%s:%s" % (k, g), "type_name": g}
+                          for g in GENRES.get(k, [])]}
+                for k, v in CATEGORIES.items()]
 
     def _filters_from(self, boot):
         """把站点的 catalog_ui.catalogs 转成 TVBox filters（真实枚举，非硬编码）"""
@@ -604,32 +596,37 @@ class Spider(Spider):
         return out
 
     def _fill_filters(self, filters, categories):
-        """每个 type_id 各拿一份独立筛选；站点没下发的用真实枚举兜底补齐"""
+        """给 class 里的每个 type_id 各配一份独立筛选。
+
+        站点下发了对应 kind 的 catalog 就用它的真实枚举；没下发的（如 documentary）
+        用该分类自己的真实枚举兜底，保证筛选条永远有内容、且各分类互不共享对象。
+        """
         source = _as_dict(filters)
-        base = source.get("movie") or next(iter(source.values()), [])
+        tids = [_text(_as_dict(x).get("type_id")) for x in _as_list(categories)]
+        tids = [t for t in tids if t]
         out = {}
-        for tid, rows in source.items():
-            tid = _text(tid)
-            cloned = _clone_filter_rows(rows)
-            if tid and cloned:
-                out[tid] = cloned
-        for item in _as_list(categories):
-            tid = _text(_as_dict(item).get("type_id"))
-            if not tid or tid in out:
+        for tid in tids:
+            if ":" in tid:          # subs 二级分类没有筛选，跳过
                 continue
-            cloned = _clone_filter_rows(base) or _clone_filter_rows(_fallback_filters(tid))
+            cloned = _clone_filter_rows(source.get(tid)) \
+                or _clone_filter_rows(_fallback_filters(tid))
             if cloned:
                 out[tid] = cloned
+        if not out:                 # 理论上不会发生，兜一层
+            for tid, rows in source.items():
+                tid = _text(tid)
+                cloned = _clone_filter_rows(rows)
+                if tid and cloned:
+                    out[tid] = cloned
         return out
 
     def homeContent(self, filter=False):
-        classes, filters = [], {}
+        classes = self._class_list()
+        filters = {}
         try:
-            boot = self._bootstrap()
-            classes = self._categories_from(boot)
-            filters = self._fill_filters(self._filters_from(boot), classes)
+            filters = self._fill_filters(self._filters_from(self._bootstrap()), classes)
         except Exception:
-            classes = classes or [{"type_id": k, "type_name": v} for k, v in CATEGORIES.items()]
+            filters = {}
         if not filters:
             filters = self._fill_filters({}, classes)
         return {"class": classes, "filters": filters, "list": []}
