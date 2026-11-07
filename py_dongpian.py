@@ -134,7 +134,7 @@ _FALLBACK_CATEGORIES = [
 ]
 
 _FALLBACK_FILTERS = [
-    {"key": "genre", "name": "分类", "value": [
+    {"key": "genre", "name": "类型", "value": [
         {"n": "全部", "v": ""},
         {"n": "喜剧", "v": "喜剧"}, {"n": "爱情", "v": "爱情"},
         {"n": "动作", "v": "动作"}, {"n": "科幻", "v": "科幻"},
@@ -156,6 +156,18 @@ _FALLBACK_FILTERS = [
         {"n": "最新", "v": "updated_desc"}, {"n": "最热", "v": "heat_desc"},
     ]},
 ]
+
+# 筛选行的显示名：站点给 genre 行下发的是"分类"，部分播放端的筛选面板对这一行
+# 不渲染行名（会留空），统一换成通用叫法"类型"，与参考实现一致，保证行名必显示。
+_ROW_LABELS = {
+    "genre": "类型",
+    "area": "地区",
+    "language": "语言",
+    "year": "年份",
+    "sort": "排序",
+    "status": "状态",
+    "orientation": "形式",
+}
 
 # 允许透传给 /v1/browse/catalog 的筛选参数（防止 extend 注入无关参数破坏签名语义）
 _FILTER_KEYS = {
@@ -361,7 +373,7 @@ def _clone_filter_rows(rows: Any) -> List[Dict[str, Any]]:
             continue
         seen_keys.add(key)
         out.append({"key": key,
-                    "name": _first(row.get("name"), key),
+                    "name": _ROW_LABELS.get(key) or _first(row.get("name"), key),
                     "value": values})
     return out
 
@@ -842,7 +854,7 @@ class Spider(_BaseSpider):
                     values.append({"n": label, "v": value})
                 if len(values) > 1:
                     rows.append({"key": key,
-                                 "name": _first(row.get("label"), key),
+                                 "name": _ROW_LABELS.get(key) or _first(row.get("label"), key),
                                  "value": values})
             if rows:
                 out[kind] = rows
