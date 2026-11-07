@@ -54,6 +54,7 @@ import json
 import math
 import re
 import secrets
+import sys
 import threading
 import time
 import urllib.error
@@ -62,6 +63,15 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_tz
 from typing import Any, Dict, List, Optional, Tuple
+
+# 播放端（TVBox / catvod 系）的 Spider 是抽象基类，采集器需要继承它才算合规实现。
+# 找不到 base 模块时（例如本地直接 python 运行）退化为普通 object，不影响自检。
+try:  # pragma: no cover
+    if ".." not in sys.path:
+        sys.path.append("..")
+    from base.spider import Spider as _BaseSpider  # type: ignore
+except Exception:  # pragma: no cover
+    _BaseSpider = object
 
 __all__ = [
     "Spider", "spider", "init", "getName", "homeContent", "homeVideoContent",
@@ -660,12 +670,22 @@ class _Http(object):
             self._cache[cache_key] = (value, now + effective)
         return value
 
+    def peek(self, key: str) -> Any:
+        """只读缓存，绝不发起网络请求（用于不能被网络阻塞的路径）。"""
+        now = time.time()
+        cache_key = self._cache_key(key, self.host)
+        with self._cache_lock:
+            hit = self._cache.get(cache_key)
+            if hit and hit[1] > now:
+                return hit[0]
+        return None
+
 
 # --------------------------------------------------------------------------- #
 # 采集主体
 # --------------------------------------------------------------------------- #
 
-class Spider(object):
+class Spider(_BaseSpider):
 
     def __init__(self, extend: Any = None) -> None:
         self._host = _DEFAULT_HOST
@@ -674,6 +694,7 @@ class Spider(object):
         self._timeout = 12.0
         self._retries = 1
         self._page_size = 20
+        self._home_deadline = 4.0
         self._account = ""
         self._password = ""
         self._accounts = _ACCOUNT_POOL
@@ -681,8 +702,10 @@ class Spider(object):
         self._http = self._new_http()
         self._meta = {}          # vod_id -> 列表卡片原始信息（补全详情缺失字段）
         self._meta_lock = threading.RLock()
-        # 初始化阶段完成登录，cookie 随后统一注入所有请求头
-        self._http.ensure_login(force=True)
+        # 构造阶段只建状态，不做任何网络请求：模块 import 就可能 new 一个实例，
+        # 若在这里同步登录，弱网/被墙时整个采集器会卡住甚至 import 失败，
+        # 播放端拿不到 homeContent，分类标签就会一个都不显示。
+        # 登录改为首个真实请求时按需完成（见 _Http.request）。
         if extend is not None:
             self.init(extend)
 
@@ -726,6 +749,8 @@ class Spider(object):
         self._timeout = float(_text(ext.get("timeout"), "12") or "12")
         self._retries = _int(ext.get("retries"), 1)
         self._page_size = _positive(ext.get("page_size"), 20, 50)
+        # 首页预热的最长等待时间：超时只影响首页影片列表，不影响分类/筛选
+        self._home_deadline = max(2.0, min(15.0, _positive(ext.get("home_deadline"), 4, 15) or 6.0))
         self._account = _text(ext.get("account") or ext.get("username"))
         self._password = _text(ext.get("password")) or self._account
         self._accounts = _normalize_accounts(ext.get("accounts")) or _ACCOUNT_POOL
@@ -737,7 +762,7 @@ class Spider(object):
             return ""
         self._cfg = new_cfg
         self._http = self._new_http()
-        self._http.ensure_login(force=True)
+        # init 同样不登录：登录在首个请求里按需完成，保证 init 立即返回
         return ""
 
     def getName(self) -> str:
@@ -751,71 +776,91 @@ class Spider(object):
             return obj
         return self._http.cached("runtime.bootstrap", 300.0, load)
 
-    def _categories(self) -> List[Dict[str, str]]:
-        def load():
-            ui = _as_dict(self._bootstrap().get("catalog_ui"))
-            out, seen = [], set()
-            for chan in _as_list(ui.get("channels")):
-                c = _as_dict(chan)
-                tid = _text(c.get("key"))
-                # 同一 type_id 只保留一个，避免出现两个同名/同 id 的分类标签
-                if not tid or tid in seen:
-                    continue
-                seen.add(tid)
-                out.append({"type_id": tid,
-                            "type_name": _first(c.get("label"), tid)})
-            return out or [dict(x) for x in _FALLBACK_CATEGORIES]
-        result = self._http.cached("categories", 300.0, load)
-        if not isinstance(result, list) or not result:
-            return [dict(x) for x in _FALLBACK_CATEGORIES]
-        # 返回深拷贝，避免调用方修改命中缓存
-        return [{"type_id": _text(_as_dict(x).get("type_id")),
-                 "type_name": _first(_as_dict(x).get("type_name"),
-                                     _as_dict(x).get("type_id"))}
-                for x in result if _text(_as_dict(x).get("type_id"))]
+    def _bootstrap_view(self, allow_fetch: bool) -> Dict[str, Any]:
+        """取运行时配置：allow_fetch=True 走缓存/请求，False 时只读缓存不联网。"""
+        if allow_fetch:
+            return self._bootstrap()
+        return _as_dict(self._http.peek("runtime.bootstrap"))
 
-    def _filters(self) -> Dict[str, Any]:
-        def load():
-            ui = _as_dict(self._bootstrap().get("catalog_ui"))
-            out = {}
-            for raw in _as_list(ui.get("catalogs")):
-                cat = _as_dict(raw)
-                kind = _text(cat.get("kind"))
-                if not kind:
+    def _categories_from(self, boot: Dict[str, Any]) -> List[Dict[str, str]]:
+        ui = _as_dict(_as_dict(boot).get("catalog_ui"))
+        out, seen = [], set()
+        for chan in _as_list(ui.get("channels")):
+            c = _as_dict(chan)
+            tid = _text(c.get("key"))
+            # 同一 type_id 只保留一个，避免出现两个同名/同 id 的分类标签
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            out.append({"type_id": tid,
+                        "type_name": _first(c.get("label"), tid)})
+        return out
+
+    def _build_categories(self) -> List[Dict[str, str]]:
+        return self._categories_from(self._bootstrap())
+
+    def _categories(self, allow_fetch: bool = True) -> List[Dict[str, str]]:
+        """分类标签。allow_fetch=False 时只读缓存，绝不触发网络。"""
+        raw = (self._http.cached("categories", 300.0, self._build_categories)
+               if allow_fetch else self._categories_from(self._bootstrap_view(False)))
+        result = []
+        seen = set()
+        for item in _as_list(raw):
+            obj = _as_dict(item)
+            tid = _text(obj.get("type_id"))
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            result.append({"type_id": tid,
+                           "type_name": _first(obj.get("type_name"), tid)})
+        # 缓存没热起来时也必须给出完整的分类，播放端才不会出现"分类空白"
+        return result or [dict(x) for x in _FALLBACK_CATEGORIES]
+
+    def _filters_from(self, boot: Dict[str, Any]) -> Dict[str, Any]:
+        ui = _as_dict(_as_dict(boot).get("catalog_ui"))
+        out = {}
+        for raw in _as_list(ui.get("catalogs")):
+            cat = _as_dict(raw)
+            kind = _text(cat.get("kind"))
+            if not kind:
+                continue
+            rows = []
+            for raw_row in _as_list(cat.get("rows")):
+                row = _as_dict(raw_row)
+                key = _text(row.get("key"))
+                if not key:
                     continue
-                rows = []
-                for raw_row in _as_list(cat.get("rows")):
-                    row = _as_dict(raw_row)
-                    key = _text(row.get("key"))
-                    if not key:
+                values = [{"n": "全部", "v": ""}]
+                for raw_opt in _as_list(row.get("options")):
+                    opt = _as_dict(raw_opt)
+                    if opt.get("enabled") is False:
                         continue
-                    values = [{"n": "全部", "v": ""}]
-                    for raw_opt in _as_list(row.get("options")):
-                        opt = _as_dict(raw_opt)
-                        if opt.get("enabled") is False:
-                            continue
-                        value = _encode_filter(_as_dict(opt.get("params")), key)
-                        if not value:
-                            continue
-                        label = _first(opt.get("label"), opt.get("key"), value)
-                        values.append({"n": label, "v": value})
-                    if len(values) > 1:
-                        rows.append({"key": key,
-                                     "name": _first(row.get("label"), key),
-                                     "value": values})
-                if rows:
-                    out[kind] = rows
-            return out
+                    value = _encode_filter(_as_dict(opt.get("params")), key)
+                    if not value:
+                        continue
+                    label = _first(opt.get("label"), opt.get("key"), value)
+                    values.append({"n": label, "v": value})
+                if len(values) > 1:
+                    rows.append({"key": key,
+                                 "name": _first(row.get("label"), key),
+                                 "value": values})
+            if rows:
+                out[kind] = rows
+        return out
 
-        raw = self._http.cached("filters", 300.0, load)
+    def _build_filters(self) -> Dict[str, Any]:
+        return self._filters_from(self._bootstrap())
+
+    def _filters(self, allow_fetch: bool = True) -> Dict[str, Any]:
+        """筛选定义。allow_fetch=False 时只读缓存，绝不触发网络。"""
+        raw = (self._http.cached("filters", 300.0, self._build_filters)
+               if allow_fetch else self._filters_from(self._bootstrap_view(False)))
         result = {}
         if isinstance(raw, dict):
             for kind, rows in raw.items():
                 cloned = _clone_filter_rows(rows)
                 if cloned:
                     result[_text(kind)] = cloned
-        if not result:
-            result["movie"] = _clone_filter_rows(_FALLBACK_FILTERS)
         return result
 
     @staticmethod
@@ -917,28 +962,37 @@ class Spider(object):
         result = self._http.cached("home.feed", 300.0, load)
         return result if isinstance(result, dict) else {}
 
-    def _home_vods(self) -> List[Dict[str, Any]]:
+    def _home_vods(self, allow_fetch: bool = True) -> List[Dict[str, Any]]:
+        feed = (self._home_feed() if allow_fetch
+                else _as_dict(self._http.peek("home.feed")))
         cards = []
-        for section in _as_list(self._home_feed().get("sections")):
+        for section in _as_list(feed.get("sections")):
             cards.extend(_as_list(_as_dict(section).get("cards")))
         return self._cards_to_vods(cards)
 
     def homeContent(self, filter: Any = False) -> Dict[str, Any]:
+        # 参考实现的思路：分类与筛选是纯本地数据，绝不依赖网络是否成功。
+        # 这里先并行预热（有硬上限），随后只读缓存组装；登录/站点慢或不可达时
+        # 依然能立刻返回分类标签 + 筛选条件，播放端不会出现"分类空白"。
+        pool = ThreadPoolExecutor(max_workers=2)
         try:
-            # 运行时配置与首页快照互不依赖，并行预热以缩短冷启动
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                boot = pool.submit(self._bootstrap)
-                feed = pool.submit(self._home_feed)
-                boot.result()
-                feed.result()
-            classes = self._categories()
+            boot = pool.submit(self._bootstrap)
+            feed = pool.submit(self._home_feed)
+            try:
+                boot.result(timeout=self._home_deadline)
+                feed.result(timeout=self._home_deadline)
+            except Exception:
+                pass
+        finally:
+            pool.shutdown(wait=False)
+        classes = self._categories(allow_fetch=False)
+        try:
             return {
                 "class": classes,
-                "filters": self._fill_filters(self._filters(), classes),
-                "list": self._home_vods(),
+                "filters": self._fill_filters(self._filters(allow_fetch=False), classes),
+                "list": self._home_vods(allow_fetch=False),
             }
         except Exception:
-            classes = [dict(x) for x in _FALLBACK_CATEGORIES]
             return {"class": classes,
                     "filters": self._fill_filters({}, classes),
                     "list": []}
