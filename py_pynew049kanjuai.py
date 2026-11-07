@@ -20,10 +20,14 @@
   备用（密码登录失败时）：POST /v1/users/anonymous  {}  -> 201，游客会话
 
 三、本文件的处理策略
-  * 所有请求头统一携带 cookie：预置 COOKIE + 运行时 CookieJar，自动吸收响应 Set-Cookie；
+  * 不再内置任何"抓包 cookie"：init 阶段直接调登录接口，靠响应的 Set-Cookie
+    建立会话，把 cookie 收进实例 CookieJar 并缓存在进程内 _SESSION，后续所有
+    请求复用；同一进程内多实例共享，换实例不重新登录；
   * 播放链路识别到 401 / login_required / *_session_required 时，
     自动调用登录接口 → 记录新 cookie → 用新 cookie 重试同一请求（只重试一次，避免死循环）；
   * cookie 每次变化都记录在 self._ck_hist 里（内存留痕，不写外部文件）；
+  * 分类与筛选来自 /v1/runtime/bootstrap 的 catalog_ui（真实数据，5 分钟缓存），
+    站点取不到时退回本文件内置的分类表，保证筛选条永远有内容；
   * 线路解析跳过"占位图"线路（官方接口存在 url_kind=mp4 但地址是 .jpg 的情况）。
 
 所有逻辑均在本文件内实现，不引用任何外部文件。
@@ -67,35 +71,11 @@ CLIENT = {
     "x-ai-movie-protocol-version": "2026-07-05.library-v2.playback-v1",
 }
 
-# 预置 cookie（抓包所得，含登录态 ai_movie_session）。
-# 仅作为 CookieJar 的初始值；登录成功后会被新会话覆盖并记录，不需要手工维护。
-#
-# 这 7 个 cookie 的真实来源（逐个抓包确认过，值都不来自登录响应体，而是 Set-Cookie 响应头
-# 或前端 JS 的 document.cookie）：
-#   ai_movie_session                  ← 登录接口的 Set-Cookie 响应头（HttpOnly，约 365 天）
-#                                       POST /v1/users/password/login 或 /v1/users/anonymous
-#                                       响应体只有 user/expires_at，会话票据只在这里出现
-#   ai_movie_browser=brw_xxx          ← 同一登录响应的 Set-Cookie（约 400 天，设备指纹）
-#   ai_movie_route_visitor=<32位hex>   ← 首次打开任意 HTML 页面时由前端网关(openresty)下发，30 天
-#   ai_movie_route_seen=1             ← 同上，1 天
-#   ai_movie_route_stay=1             ← 同上，1 天
-#   ai_movie_route_target=<域名>       ← 前端 route-transfer.js 写入，记录从哪个镜像域名(如 kanju48.com)跳转进来，30 天
-#   ai_movie_home_address_visited_v1  ← 前端 HomeAddressReminder 组件 document.cookie 写入的"已看过首页地址提醒"标记，365 天
-#
-# 实测权限只认 ai_movie_session：
-#   只带 ai_movie_session            -> resolve-line 201，拿到播放地址
-#   只带其余 6 个（无 session）        -> 401 playback_user_session_required
-#   完全不带 cookie                  -> 401 playback_user_session_required
-# 其余 6 个只为"看起来像真实浏览器"，不参与鉴权。
-COOKIE = (
-    "ai_movie_home_address_visited_v1=1; "
-    "ai_movie_browser=brw_-syhLxLb2T4Q6Yxb7oLl0VZyaSNcO-kl2sM0O-47Q3k; "
-    "ai_movie_route_visitor=52f0efcb699c8d5021824e0efbbc2df0; "
-    "ai_movie_route_seen=1; "
-    "ai_movie_route_target=kanju48.com; "
-    "ai_movie_route_stay=1; "
-    "ai_movie_session=ums_NtLodi5Nn-wSgZuZnLQYtxb-ZnVx1ROjyqjyzEO76Rg"
-)
+# 说明：本文件不再预置抓包 cookie。
+# 会话统一由 init() 调 POST /v1/users/password/login 建立：
+#   登录响应头 Set-Cookie: ai_movie_session=ums_xxx; ai_movie_browser=brw_xxx
+# 由 _absorb() 收进 self._jar，并写入进程内 _SESSION，后续请求复用、换实例不重登。
+# 鉴权只认 ai_movie_session；ai_movie_browser 只是设备指纹，随登录响应一起拿到。
 
 # ---- 登录相关 ----
 ACCOUNT = "kanju3126"                       # 账号
@@ -125,20 +105,6 @@ GENRES = {
 IMG_KIND = ("image", "img", "jpg", "jpeg", "png", "poster", "cover", "screenshot")
 
 
-def _ck_parse(s):
-    """'a=1; b=2' -> {'a':'1','b':'2'}（保序、丢弃空值）"""
-    d = {}
-    for part in str(s or "").split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        k, v = k.strip(), v.strip()
-        if k and v:
-            d[k] = v
-    return d
-
-
 def _ck_join(d):
     return "; ".join("%s=%s" % (k, v) for k, v in (d or {}).items() if v)
 
@@ -155,32 +121,171 @@ def _is_img(url, line=None):
     return kind in IMG_KIND
 
 
+# --------------------------------------------------------------------------- #
+# 筛选（filters）工具
+# --------------------------------------------------------------------------- #
+
+def _text(v, default=""):
+    if v is None:
+        return default
+    s = str(v).strip()
+    return s if s else default
+
+
+def _first(*vals):
+    for v in vals:
+        s = _text(v)
+        if s:
+            return s
+    return ""
+
+
+def _as_dict(v):
+    return v if isinstance(v, dict) else {}
+
+
+def _as_list(v):
+    return v if isinstance(v, list) else []
+
+
+def _encode_filter(params, key):
+    """筛选项 -> TVBox 的 v 值；多参数项编码成 query 串，由 categoryContent 还原。"""
+    items = [(_text(k), _text(v)) for k, v in _as_dict(params).items()]
+    items = [(k, v) for k, v in items if k and v]
+    if not items:
+        return ""
+    if len(items) == 1 and items[0][0] == key:
+        return items[0][1]
+    return urllib.parse.urlencode(items)
+
+
+def _clone_filter_rows(rows):
+    """深拷贝筛选行，保证每个分类各持一份独立对象（不共享 list/引用）。"""
+    out, seen_keys = [], set()
+    for raw_row in _as_list(rows):
+        row = _as_dict(raw_row)
+        key = _text(row.get("key"))
+        if not key or key in seen_keys:
+            continue
+        values, names = [], set()
+        for raw_opt in _as_list(row.get("value")):
+            opt = _as_dict(raw_opt)
+            label = _text(opt.get("n"))
+            if not label or label in names:
+                continue
+            names.add(label)
+            values.append({"n": label, "v": _text(opt.get("v"))})
+        if len(values) < 2:
+            continue
+        seen_keys.add(key)
+        out.append({"key": key,
+                    "name": _ROW_LABELS.get(key) or _first(row.get("name"), key),
+                    "value": values})
+    return out
+
+
+# 筛选行的显示名：站点给 genre 行下发的是"分类"，部分播放端的筛选面板对这一行
+# 不渲染行名（会留空），统一换成通用叫法"类型"，保证行名必定显示。
+_ROW_LABELS = {
+    "genre": "类型",
+    "area": "地区",
+    "language": "语言",
+    "year": "年份",
+    "sort": "排序",
+    "status": "状态",
+    "orientation": "形式",
+}
+
+# 允许透传给 /v1/browse/catalog 的筛选参数（其余 extend 键一律丢弃）
+_FILTER_KEYS = (
+    "genre", "area", "language", "year", "year_gte", "year_lte",
+    "sort", "status", "orientation", "q",
+)
+
+
+def _parse_extend(extend):
+    """TVBox 的 extend 可能是 dict / JSON 串 / query 串，统一成只含白名单键的 dict"""
+    ex = {}
+    if isinstance(extend, dict):
+        ex = extend
+    elif isinstance(extend, str) and extend.strip():
+        s = extend.strip()
+        try:
+            parsed = json.loads(s)
+            ex = parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            try:
+                ex = dict(urllib.parse.parse_qsl(s))
+            except Exception:
+                ex = {}
+    out = {}
+    for k in _FILTER_KEYS:
+        v = _text(ex.get(k))
+        if not v:
+            continue
+        if "=" in v:
+            # 复合项（如 "2010_2017" 被编码成 "year_gte=2010&year_lte=2017"）：
+            # 拆成多个真实查询参数，别把整个串塞进一个参数里
+            pair = dict(urllib.parse.parse_qsl(v))
+            if pair:
+                for pk, pv in pair.items():
+                    if pk in _FILTER_KEYS and pv:
+                        out[pk] = pv
+                continue
+        out[k] = v
+    return out
+
+
+def _fallback_filters(kind):
+    """站点不可用时的兜底筛选：类型/地区/语言/年份/排序（选项来自站点真实枚举）。"""
+    return [
+        {"key": "genre", "name": _ROW_LABELS["genre"], "value":
+            [{"n": "全部", "v": ""}] + [{"n": g, "v": g} for g in GENRES.get(kind, [])]},
+        {"key": "area", "name": _ROW_LABELS["area"], "value": [
+            {"n": "全部", "v": ""}, {"n": "大陆", "v": "中国大陆"},
+            {"n": "香港", "v": "中国香港"}, {"n": "台湾", "v": "中国台湾"},
+            {"n": "日本", "v": "日本"}, {"n": "韩国", "v": "韩国"}, {"n": "欧美", "v": "欧美"},
+        ]},
+        {"key": "language", "name": _ROW_LABELS["language"], "value": [
+            {"n": "全部", "v": ""}, {"n": "国语", "v": "国语"}, {"n": "粤语", "v": "粤语"},
+            {"n": "英语", "v": "英语"}, {"n": "日语", "v": "日语"}, {"n": "韩语", "v": "韩语"},
+        ]},
+        {"key": "year", "name": _ROW_LABELS["year"], "value": [
+            {"n": "全部", "v": ""}, {"n": "2026", "v": "2026"}, {"n": "2025", "v": "2025"},
+            {"n": "2024", "v": "2024"}, {"n": "更早", "v": "year_lte=2023"},
+        ]},
+        {"key": "sort", "name": _ROW_LABELS["sort"], "value": [
+            {"n": "全部", "v": ""}, {"n": "最新", "v": "updated_desc"}, {"n": "最热", "v": "heat_desc"},
+        ]},
+    ]
+
+
 class Spider(Spider):
     def init(self, extend=""):
-        # ---- CookieJar：预置 cookie + 跨实例缓存 + 响应 Set-Cookie ----
-        self._jar = _ck_parse(COOKIE)
+        # ---- CookieJar：只放"登录接口真实下发"的会话，不再有预置 cookie ----
+        self._jar = {}
         for k, v in (_SESSION.get("jar") or {}).items():
             self._jar[k] = v
         self._ck_hist = []          # 记录用：cookie 每次变化留痕
         self._login_t = _SESSION.get("t", 0)
         self._user = _SESSION.get("user", {}) or {}
         self._valid = bool(_SESSION.get("valid"))   # 会话是否已被服务端验证过
-        self._record("seed")
+        self._record("init")
 
+        # 1) 先选定可用域名（这一步不需要会话）
+        self._hi = 0
         for i, h in enumerate(HOSTS):
             try:
-                r = self.fetch(h, headers={"User-Agent": UA, "Cookie": self._cookie_header()}, timeout=15000)
+                r = self.fetch(h, headers={"User-Agent": UA}, timeout=15000)
                 if getattr(r, 'status_code', None) == 200:
                     self._hi = i
                     break
             except Exception:
                 continue
-        else:
-            self._hi = 0
 
-        # 没有会话就登录（优先账号密码）
-        if not self._has_session():
-            self._login(force=True)
+        # 2) 用登录接口初始化会话：Set-Cookie 由 _absorb 收进 _jar，
+        #    并写进 _SESSION，后续所有请求（含播放）复用同一份 cookie。
+        self._login()
         return ""
 
     # ------------------------------------------------------------------ #
@@ -432,14 +537,102 @@ class Spider(Spider):
             "vod_director": "/".join((c.get("directors") or [])[:2]),
         }
 
+    # ------------------------------------------------------------------ #
+    # 分类 / 筛选（数据来自 /v1/runtime/bootstrap 的 catalog_ui）
+    # ------------------------------------------------------------------ #
+    def _bootstrap(self):
+        """运行时配置（含 catalog_ui 分类与筛选枚举），5 分钟缓存，取不到返回 {}"""
+        now = time.time()
+        if getattr(self, "_bs_t", 0) > now - 300 and isinstance(getattr(self, "_bs", None), dict):
+            return self._bs
+        code, j = self._api("GET", "/v1/runtime/bootstrap")
+        if code not in (200, 201) or not isinstance(j, dict):
+            j = {}
+        self._bs, self._bs_t = j, now
+        return j
+
+    def _categories_from(self, boot):
+        """站点下发的分类标签（channels），没有就退回内置 CATEGORIES"""
+        out, seen = [], set()
+        ui = _as_dict(_as_dict(boot).get("catalog_ui"))
+        for chan in _as_list(ui.get("channels")):
+            c = _as_dict(chan)
+            tid = _text(c.get("key"))
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            out.append({"type_id": tid, "type_name": _first(c.get("label"), tid)})
+        if out:
+            return out
+        return [{"type_id": k, "type_name": v} for k, v in CATEGORIES.items()]
+
+    def _filters_from(self, boot):
+        """把站点的 catalog_ui.catalogs 转成 TVBox filters（真实枚举，非硬编码）"""
+        ui = _as_dict(_as_dict(boot).get("catalog_ui"))
+        out = {}
+        for raw in _as_list(ui.get("catalogs")):
+            cat = _as_dict(raw)
+            kind = _text(cat.get("kind"))
+            if not kind:
+                continue
+            rows = []
+            for raw_row in _as_list(cat.get("rows")):
+                row = _as_dict(raw_row)
+                key = _text(row.get("key"))
+                if not key:
+                    continue
+                values = [{"n": "全部", "v": ""}]
+                for raw_opt in _as_list(row.get("options")):
+                    opt = _as_dict(raw_opt)
+                    if opt.get("enabled") is False:
+                        continue
+                    value = _encode_filter(opt.get("params"), key)
+                    if not value:
+                        # 站点没给参数（短剧的 status / orientation 就是这样），
+                        # 这一行选了也不生效，直接不输出，避免出现"点了没反应"的空行
+                        continue
+                    label = _first(opt.get("label"), opt.get("key"), value)
+                    if any(x["n"] == label for x in values):
+                        continue
+                    values.append({"n": label, "v": value})
+                if len(values) > 1:
+                    rows.append({"key": key,
+                                 "name": _first(row.get("label"), key),
+                                 "value": values})
+            if rows:
+                out[kind] = rows
+        return out
+
+    def _fill_filters(self, filters, categories):
+        """每个 type_id 各拿一份独立筛选；站点没下发的用真实枚举兜底补齐"""
+        source = _as_dict(filters)
+        base = source.get("movie") or next(iter(source.values()), [])
+        out = {}
+        for tid, rows in source.items():
+            tid = _text(tid)
+            cloned = _clone_filter_rows(rows)
+            if tid and cloned:
+                out[tid] = cloned
+        for item in _as_list(categories):
+            tid = _text(_as_dict(item).get("type_id"))
+            if not tid or tid in out:
+                continue
+            cloned = _clone_filter_rows(base) or _clone_filter_rows(_fallback_filters(tid))
+            if cloned:
+                out[tid] = cloned
+        return out
+
     def homeContent(self, filter=False):
-        cls = []
-        for k, v in CATEGORIES.items():
-            cls.append({
-                "type_id": k, "type_name": v,
-                "subs": [{"type_id": "%s:%s" % (k, g), "type_name": g} for g in GENRES[k]],
-            })
-        return {"class": cls, "list": []}
+        classes, filters = [], {}
+        try:
+            boot = self._bootstrap()
+            classes = self._categories_from(boot)
+            filters = self._fill_filters(self._filters_from(boot), classes)
+        except Exception:
+            classes = classes or [{"type_id": k, "type_name": v} for k, v in CATEGORIES.items()]
+        if not filters:
+            filters = self._fill_filters({}, classes)
+        return {"class": classes, "filters": filters, "list": []}
 
     def homeVideoContent(self):
         now = time.time()
@@ -470,15 +663,30 @@ class Spider(Spider):
         except Exception:
             pass
         cat, gen = str(tid), ""
-        if ":" in cat:
+        if ":" in cat:                      # 兼容 "movie:喜剧" 这种旧式子分类
             cat, gen = cat.split(":", 1)
-        if cat not in CATEGORIES:
-            cat = "movie"
-        if gen:
-            path = "/v1/browse/catalog?kind=%s&genre=%s&page=%d&limit=40" % (cat, urllib.parse.quote(gen), pn)
+        ex = _parse_extend(extend)
+        if gen and not ex.get("genre"):
+            ex["genre"] = gen
+
+        params = []
+        if cat == "updates":                # 站点伪分类：全站最近更新
+            params.append("sort=" + ex.pop("sort", "updated_desc"))
+        elif cat == "recommend":            # 站点伪分类：AI找剧 / 热门
+            params.append("sort=" + ex.pop("sort", "trending"))
+            params.append("window=day")
         else:
-            path = "/v1/browse/catalog?kind=%s&page=%d&limit=40" % (cat, pn)
-        j = self._req("GET", path)
+            if cat not in CATEGORIES:
+                cat = "movie"
+            params.append("kind=" + cat)
+        for k in _FILTER_KEYS:
+            v = ex.get(k)
+            if v:
+                params.append("%s=%s" % (k, urllib.parse.quote(v)))
+        params.append("page=%d" % pn)
+        params.append("limit=40")
+
+        j = self._req("GET", "/v1/browse/catalog?" + "&".join(params))
         cards = j.get("cards") or []
         total = (j.get("pagination") or {}).get("total", 0) or 0
         return {"page": pn, "pagecount": max(math.ceil(total / 40), 1), "limit": 40, "total": total, "list": [self._vod(c) for c in cards]}
