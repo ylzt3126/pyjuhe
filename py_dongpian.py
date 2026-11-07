@@ -324,6 +324,38 @@ def _encode_filter(params: Dict[str, Any], key: str) -> str:
     return urllib.parse.urlencode(items)
 
 
+def _clone_filter_rows(rows: Any) -> List[Dict[str, Any]]:
+    """把筛选定义深拷贝成一份全新对象（行/选项都不共享引用）。
+
+    TVBox 系播放端按 type_id 取 filters；若多个分类指向同一个 list 对象，
+    部分端在 Python -> Java -> JSON 的递归转换阶段会合并重复引用甚至丢弃，
+    表现就是分类页的筛选条件显示不出来。因此每个分类必须各持一份独立副本。
+    """
+    out = []          # type: List[Dict[str, Any]]
+    seen_keys = set()
+    for raw_row in _as_list(rows):
+        row = _as_dict(raw_row)
+        key = _text(row.get("key"))
+        if not key or key in seen_keys:
+            continue
+        values = []   # type: List[Dict[str, str]]
+        names = set()
+        for raw_opt in _as_list(row.get("value")):
+            opt = _as_dict(raw_opt)
+            label = _text(opt.get("n"))
+            if not label or label in names:
+                continue
+            names.add(label)
+            values.append({"n": label, "v": _text(opt.get("v"))})
+        if len(values) < 2:
+            continue
+        seen_keys.add(key)
+        out.append({"key": key,
+                    "name": _first(row.get("name"), key),
+                    "value": values})
+    return out
+
+
 def _empty_page(page: int = 1, limit: int = 20) -> Dict[str, Any]:
     return {"list": [], "page": page, "pagecount": 0, "limit": limit, "total": 0}
 
@@ -722,16 +754,25 @@ class Spider(object):
     def _categories(self) -> List[Dict[str, str]]:
         def load():
             ui = _as_dict(self._bootstrap().get("catalog_ui"))
-            out = []
+            out, seen = [], set()
             for chan in _as_list(ui.get("channels")):
                 c = _as_dict(chan)
                 tid = _text(c.get("key"))
-                if tid:
-                    out.append({"type_id": tid,
-                                "type_name": _first(c.get("label"), tid)})
+                # 同一 type_id 只保留一个，避免出现两个同名/同 id 的分类标签
+                if not tid or tid in seen:
+                    continue
+                seen.add(tid)
+                out.append({"type_id": tid,
+                            "type_name": _first(c.get("label"), tid)})
             return out or [dict(x) for x in _FALLBACK_CATEGORIES]
         result = self._http.cached("categories", 300.0, load)
-        return result if isinstance(result, list) and result else [dict(x) for x in _FALLBACK_CATEGORIES]
+        if not isinstance(result, list) or not result:
+            return [dict(x) for x in _FALLBACK_CATEGORIES]
+        # 返回深拷贝，避免调用方修改命中缓存
+        return [{"type_id": _text(_as_dict(x).get("type_id")),
+                 "type_name": _first(_as_dict(x).get("type_name"),
+                                     _as_dict(x).get("type_id"))}
+                for x in result if _text(_as_dict(x).get("type_id"))]
 
     def _filters(self) -> Dict[str, Any]:
         def load():
@@ -764,18 +805,46 @@ class Spider(object):
                                      "value": values})
                 if rows:
                     out[kind] = rows
-            if not out:
-                return {"movie": _FALLBACK_FILTERS}
-            common = out.get("movie") or next(iter(out.values()))
-            out.setdefault("recommend", common)
-            out.setdefault("updates", common)
-            for entry in _FALLBACK_CATEGORIES:
-                tid = _text(entry.get("type_id"))
-                if tid and tid not in out:
-                    out[tid] = common
             return out
-        result = self._http.cached("filters", 300.0, load)
-        return result if isinstance(result, dict) and result else {"movie": _FALLBACK_FILTERS}
+
+        raw = self._http.cached("filters", 300.0, load)
+        result = {}
+        if isinstance(raw, dict):
+            for kind, rows in raw.items():
+                cloned = _clone_filter_rows(rows)
+                if cloned:
+                    result[_text(kind)] = cloned
+        if not result:
+            result["movie"] = _clone_filter_rows(_FALLBACK_FILTERS)
+        return result
+
+    @staticmethod
+    def _fill_filters(filters: Any, categories: List[Dict[str, str]]) -> Dict[str, Any]:
+        """保证 class 里每个 type_id 都有一份自己独立的筛选定义。
+
+        - 已有筛选的 kind：深拷贝一份，绝不与其他分类共享同一个对象；
+        - 站点没有下发筛选的 tid（recommend / updates 等）：用真实 kind 的通用
+          一份补齐，而不是缺 key，否则播放端会认为该分类"不支持筛选"。
+        """
+        source = _as_dict(filters)
+        base = (source.get("movie") or source.get("series")
+                or source.get("updates") or next(iter(source.values()), []))
+        out = {}
+        for tid, rows in source.items():
+            tid = _text(tid)
+            cloned = _clone_filter_rows(rows)
+            if tid and cloned:
+                out[tid] = cloned
+        for item in _as_list(categories):
+            tid = _text(_as_dict(item).get("type_id"))
+            if not tid or tid in out:
+                continue
+            cloned = _clone_filter_rows(base) or _clone_filter_rows(_FALLBACK_FILTERS)
+            if cloned:
+                out[tid] = cloned
+        if not out:
+            out["movie"] = _clone_filter_rows(_FALLBACK_FILTERS)
+        return out
 
     # -- 卡片 -> TVBox VOD --------------------------------------------------- #
 
@@ -862,14 +931,17 @@ class Spider(object):
                 feed = pool.submit(self._home_feed)
                 boot.result()
                 feed.result()
+            classes = self._categories()
             return {
-                "class": self._categories(),
-                "filters": self._filters(),
+                "class": classes,
+                "filters": self._fill_filters(self._filters(), classes),
                 "list": self._home_vods(),
             }
         except Exception:
-            return {"class": [dict(x) for x in _FALLBACK_CATEGORIES],
-                    "filters": {"movie": _FALLBACK_FILTERS}, "list": []}
+            classes = [dict(x) for x in _FALLBACK_CATEGORIES]
+            return {"class": classes,
+                    "filters": self._fill_filters({}, classes),
+                    "list": []}
 
     def homeVideoContent(self) -> Dict[str, Any]:
         try:
