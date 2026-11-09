@@ -4,61 +4,61 @@
       "key": "py_pynew029soujuai",
       "name": "🎬影视｜搜剧AI",
       "type": 3,
-      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_pynew029soujuai.py"
+      "api": "./py_pynew029soujuai.py"
     },
     {
       "key": "py_pynew049kanjuai",
       "name": "🎬影视｜看剧AI",
       "type": 3,
-      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_pynew049kanjuai.py"
+      "api": "./py_pynew049kanjuai.py"
     },
 	{
       "key": "py_dongpian",
       "name": "🎬影视｜懂片帝AI",
       "type": 3,
-      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_dongpian.py"
+      "api": "./py_dongpian.py"
     },
     {
       "key": "py_pynew057jinpaiapp",
       "name": "🎬影视｜金牌APP",
       "type": 3,
-      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_pynew057jinpaiapp.py"
+      "api": "./py_pynew057jinpaiapp.py"
     },
     {
       "key": "py_pynew064guaziapp",
       "name": "🎬影视｜瓜子APP",
       "type": 3,
-      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_pynew064guaziapp.py"
+      "api": "./py_pynew064guaziapp.py"
     },
     {
       "key": "py_pynew073duoduoyingsh",
       "name": "🎬影视｜多多影视",
       "type": 3,
-      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_pynew073duoduoyingsh.py"
+      "api": "./py_pynew073duoduoyingsh.py"
     },
     {
       "key": "py_juxiafan4kyingshi",
       "name": "🎬影视｜剧下饭影视",
       "type": 3,
-      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_juxiafan4kyingshi.py"
+      "api": "./py_juxiafan4kyingshi.py"
     },
 	{
       "key": "changzhangziyuan",
       "name": "🎬影视｜厂长资源",
       "type": 3,
-      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_changzhangziyuan.py"
+      "api": "./py_changzhangziyuan.py"
     },
 	{
       "key": "py_fkankanya",
       "name": "🎬影视｜看看鸭",
       "type": 3,
-      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_kankanya.py"
+      "api": "./py_kankanya.py"
     },
     {
       "key": "py_juzhi",
       "name": "🎬影视｜剧汁影视",
       "type": 3,
-      "api": "https://gh-proxy.com/https://raw.githubusercontent.com/ylzt3126/pyjuhe/main/py_juzhi.py"
+      "api": "./py_juzhi.py"
     }
   ],
   "parses": [
