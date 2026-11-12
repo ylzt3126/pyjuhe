@@ -34,15 +34,11 @@ playerContent    {"parse": 0, "play": "", "url": "...", "header": {...}, ...}
     headers = x-ai-movie-timestamp / x-ai-movie-nonce / x-ai-movie-signature
 分隔符为换行符而非空格，pathname+search 必须与最终请求的 URL 完全一致。
 
-最近更新（追剧表实现）
+最近更新
 ----------------------
-「最近更新」(updates) 是唯一入口，其内部逻辑已完整替换为追剧表实现：
-数据来自网页 /updates 的「追剧周表」同源接口 GET /v1/watch-calendar，
-原先的 /v1/browse/catalog?sort=updated_desc 逻辑已废弃；标题、type_id 与
-页面位置保持不变，不再单独提供「追剧表」分类。
+「最近更新」(updates)数据来自网页 /updates 的「追剧周表」同源接口 GET /v1/watch-calendar，
 只取今天（Asia/Shanghai）当天、按 weekday + kind 拉取。接口支持 limit 与
 TVBox 每页条数一致（默认 20），因此一页对应一次请求，用 next_cursor 推进，
-既不做本地切片，也不预先拉取整天数据。筛选行 cal_kind 提供
 电视剧 / 动漫 / 电影 / 综艺，未选择时默认电视剧。
 
 初始化与播放优选
@@ -144,9 +140,7 @@ _FALLBACK_CATEGORIES = [
     {"type_id": "short_drama", "type_name": "短剧"},
 ]
 
-# ---- 最近更新：追剧表实现 -------------------------------------------------- #
-# 「最近更新」(updates) 是唯一入口：标题、type_id、位置沿用站点 channels，
-# 数据来源 / 状态 / 分页 / 筛选则全部由下面的追剧表逻辑提供。
+# ---- 最近更新实现 -------------------------------------------------- #
 _CALENDAR_TIDS = ("updates",)
 _CALENDAR_PATH = "/v1/watch-calendar"
 _CALENDAR_DEFAULT_KIND = "series"
@@ -752,7 +746,7 @@ class Spider(_BaseSpider):
         self._http = self._new_http()
         self._meta = {}          # vod_id -> 列表卡片原始信息（补全详情缺失字段）
         self._meta_lock = threading.RLock()
-        # 追剧表按需懒加载状态：(host, 今天, 类型) -> 已拉取条目 + 下一批 cursor
+        # 按需懒加载状态：(host, 今天, 类型) -> 已拉取条目 + 下一批 cursor
         self._calendar_states = {}   # type: Dict[Any, Dict[str, Any]]
         self._calendar_lock = threading.RLock()
         # 构造阶段只建状态，不做任何网络请求：模块 import 就可能 new 一个实例，
@@ -919,12 +913,6 @@ class Spider(_BaseSpider):
     @staticmethod
     def _fill_filters(filters: Any, categories: List[Dict[str, str]]) -> Dict[str, Any]:
         """保证 class 里每个 type_id 都有一份自己独立的筛选定义。
-
-        - 已有筛选的 kind：深拷贝一份，绝不与其他分类共享同一个对象；
-        - 站点没有下发筛选的 tid（recommend 等）：用真实 kind 的通用
-          一份补齐，而不是缺 key，否则播放端会认为该分类"不支持筛选"；
-        - 「最近更新」固定使用追剧表的「类型」筛选（4 种内容类型），
-          持有独立副本，不能被通用筛选行覆盖或填充。
         """
         source = _as_dict(filters)
         base = (source.get("movie") or source.get("series")
@@ -1065,7 +1053,7 @@ class Spider(_BaseSpider):
         except Exception:
             return {"list": []}
 
-    # -- 最近更新（追剧表实现） ---------------------------------------------- #
+    # -- 最近更新 ---------------------------------------------- #
 
     @staticmethod
     def _calendar_kind(extend: Any) -> str:
@@ -1117,7 +1105,7 @@ class Spider(_BaseSpider):
 
     @staticmethod
     def _calendar_card(card: Dict[str, Any], kind: str) -> Dict[str, Any]:
-        """追剧表卡片 -> 通用卡片字段，复用 _vod_from_card 的映射。"""
+        """最近更新卡片 -> 通用卡片字段，复用 _vod_from_card 的映射。"""
         c = dict(card)
         forecast = _as_dict(c.get("forecast"))
         c["remarks"] = _first(c.get("latest_episode_label"),
@@ -1202,7 +1190,7 @@ class Spider(_BaseSpider):
 
     def _calendar_content(self, extend: Any, page: int,
                           limit: int) -> Dict[str, Any]:
-        """追剧表分页：今天 + 选定类型，一页对应一次接口请求，无本地切片。"""
+        """最近更新分页：今天 + 选定类型，一页对应一次接口请求，无本地切片。"""
         kind = self._calendar_kind(extend)
         today, weekday = self._calendar_day()
         with self._calendar_lock:
@@ -1293,8 +1281,7 @@ class Spider(_BaseSpider):
         limit = self._page_size
         try:
             type_id = _text(tid)
-            # 「最近更新」走追剧表实现（原 updates 的
-            # /v1/browse/catalog?sort=updated_desc 逻辑已废弃）
+    
             if type_id in _CALENDAR_TIDS:
                 return self._calendar_content(extend, page, limit)
             params = {"page": page, "limit": limit}
