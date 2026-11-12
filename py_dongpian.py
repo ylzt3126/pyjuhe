@@ -34,6 +34,17 @@ playerContent    {"parse": 0, "play": "", "url": "...", "header": {...}, ...}
     headers = x-ai-movie-timestamp / x-ai-movie-nonce / x-ai-movie-signature
 分隔符为换行符而非空格，pathname+search 必须与最终请求的 URL 完全一致。
 
+最近更新（追剧表实现）
+----------------------
+「最近更新」(updates) 是唯一入口，其内部逻辑已完整替换为追剧表实现：
+数据来自网页 /updates 的「追剧周表」同源接口 GET /v1/watch-calendar，
+原先的 /v1/browse/catalog?sort=updated_desc 逻辑已废弃；标题、type_id 与
+页面位置保持不变，不再单独提供「追剧表」分类。
+只取今天（Asia/Shanghai）当天、按 weekday + kind 拉取。接口支持 limit 与
+TVBox 每页条数一致（默认 20），因此一页对应一次请求，用 next_cursor 推进，
+既不做本地切片，也不预先拉取整天数据。筛选行 cal_kind 提供
+电视剧 / 动漫 / 电影 / 综艺，未选择时默认电视剧。
+
 初始化与播放优选
 ----------------
 1. 初始化阶段调用 /v1/users/password/login 建立会话：默认账号池共 10 个
@@ -132,6 +143,30 @@ _FALLBACK_CATEGORIES = [
     {"type_id": "variety", "type_name": "综艺"},
     {"type_id": "short_drama", "type_name": "短剧"},
 ]
+
+# ---- 最近更新：追剧表实现 -------------------------------------------------- #
+# 「最近更新」(updates) 是唯一入口：标题、type_id、位置沿用站点 channels，
+# 数据来源 / 状态 / 分页 / 筛选则全部由下面的追剧表逻辑提供。
+_CALENDAR_TIDS = ("updates",)
+_CALENDAR_PATH = "/v1/watch-calendar"
+_CALENDAR_DEFAULT_KIND = "series"
+# 顺序即筛选面板顺序：第一项「电视剧」同时是未选择时的默认类型
+_CALENDAR_KINDS = (
+    ("series", "电视剧"),
+    ("anime", "动漫"),
+    ("movie", "电影"),
+    ("variety", "综艺"),
+)
+_CALENDAR_KIND_IDS = tuple(k for k, _ in _CALENDAR_KINDS)
+_CALENDAR_FILTERS = [
+    {"key": "cal_kind", "name": "类型", "value": [
+        {"n": label, "v": kind} for kind, label in _CALENDAR_KINDS
+    ]},
+]
+# 一页一次请求，limit 直接取 TVBox 的每页条数；跳页时最多顺序补齐 30 页
+# 的 cursor 链，防止异常快照下无限翻页
+_CALENDAR_MAX_CHAIN_FETCHES = 30
+_CALENDAR_TTL = 300.0
 
 _FALLBACK_FILTERS = [
     {"key": "genre", "name": "类型", "value": [
@@ -541,10 +576,13 @@ class _Http(object):
         except Exception:
             pass
 
-    def _timestamp(self) -> str:
+    def now(self) -> float:
+        """按服务器 Date 头校正过的当前时间（Unix 秒），供日期类业务使用。"""
         with self._lock:
-            offset = self._clock_offset
-        return str(int((time.time() + offset) * 1000))
+            return time.time() + self._clock_offset
+
+    def _timestamp(self) -> str:
+        return str(int(self.now() * 1000))
 
     # -- 请求 ---------------------------------------------------------------- #
 
@@ -714,6 +752,9 @@ class Spider(_BaseSpider):
         self._http = self._new_http()
         self._meta = {}          # vod_id -> 列表卡片原始信息（补全详情缺失字段）
         self._meta_lock = threading.RLock()
+        # 追剧表按需懒加载状态：(host, 今天, 类型) -> 已拉取条目 + 下一批 cursor
+        self._calendar_states = {}   # type: Dict[Any, Dict[str, Any]]
+        self._calendar_lock = threading.RLock()
         # 构造阶段只建状态，不做任何网络请求：模块 import 就可能 new 一个实例，
         # 若在这里同步登录，弱网/被墙时整个采集器会卡住甚至 import 失败，
         # 播放端拿不到 homeContent，分类标签就会一个都不显示。
@@ -880,8 +921,10 @@ class Spider(_BaseSpider):
         """保证 class 里每个 type_id 都有一份自己独立的筛选定义。
 
         - 已有筛选的 kind：深拷贝一份，绝不与其他分类共享同一个对象；
-        - 站点没有下发筛选的 tid（recommend / updates 等）：用真实 kind 的通用
-          一份补齐，而不是缺 key，否则播放端会认为该分类"不支持筛选"。
+        - 站点没有下发筛选的 tid（recommend 等）：用真实 kind 的通用
+          一份补齐，而不是缺 key，否则播放端会认为该分类"不支持筛选"；
+        - 「最近更新」固定使用追剧表的「类型」筛选（4 种内容类型），
+          持有独立副本，不能被通用筛选行覆盖或填充。
         """
         source = _as_dict(filters)
         base = (source.get("movie") or source.get("series")
@@ -889,18 +932,20 @@ class Spider(_BaseSpider):
         out = {}
         for tid, rows in source.items():
             tid = _text(tid)
+            if tid in _CALENDAR_TIDS:
+                continue
             cloned = _clone_filter_rows(rows)
             if tid and cloned:
                 out[tid] = cloned
         for item in _as_list(categories):
             tid = _text(_as_dict(item).get("type_id"))
-            if not tid or tid in out:
+            if not tid or tid in out or tid in _CALENDAR_TIDS:
                 continue
             cloned = _clone_filter_rows(base) or _clone_filter_rows(_FALLBACK_FILTERS)
             if cloned:
                 out[tid] = cloned
-        if not out:
-            out["movie"] = _clone_filter_rows(_FALLBACK_FILTERS)
+        for tid in _CALENDAR_TIDS:
+            out[tid] = _clone_filter_rows(_CALENDAR_FILTERS)
         return out
 
     # -- 卡片 -> TVBox VOD --------------------------------------------------- #
@@ -1020,6 +1065,175 @@ class Spider(_BaseSpider):
         except Exception:
             return {"list": []}
 
+    # -- 最近更新（追剧表实现） ---------------------------------------------- #
+
+    @staticmethod
+    def _calendar_kind(extend: Any) -> str:
+        """解析类型筛选；兼容多种播放端传入的 key 与中文标签，缺省电视剧。"""
+        ext = _parse_extend(extend)
+        raw = ""
+        for key in ("cal_kind", "kind", "content_kind", "calendar_kind", "type"):
+            raw = _single_value(ext.get(key))
+            if raw:
+                break
+        if raw in _CALENDAR_KIND_IDS:
+            return raw
+        for kind, label in _CALENDAR_KINDS:
+            if raw == label:
+                return kind
+        return _CALENDAR_DEFAULT_KIND
+
+    def _calendar_day(self) -> Tuple[str, int]:
+        """今天（Asia/Shanghai）与站点 weekday（周一=1 ... 周日=7）。"""
+        t = time.gmtime(self._http.now() + 8 * 3600)
+        return ("%04d-%02d-%02d" % (t.tm_year, t.tm_mon, t.tm_mday), t.tm_wday + 1)
+
+    @staticmethod
+    def _calendar_weekday(obj: Dict[str, Any], today: str) -> int:
+        """从 days 中找今天对应的 weekday；days 只有一天时用于校验日期。"""
+        for raw in _as_list(_as_dict(obj).get("days")):
+            day = _as_dict(raw)
+            if _text(day.get("date")) == today:
+                return _int(day.get("weekday"), 0)
+        return 0
+
+    @staticmethod
+    def _calendar_group(obj: Dict[str, Any], kind: str,
+                        today: str) -> Dict[str, Any]:
+        """取今天、指定类型那一组；请求带 weekday 时 days 通常只有一天。"""
+        days = [_as_dict(x) for x in _as_list(_as_dict(obj).get("days"))]
+        for day in days:
+            if len(days) > 1 and _text(day.get("date")) != today:
+                continue
+            group = _as_dict(_as_dict(day.get("groups")).get(kind))
+            if group:
+                return group
+        # 日期与快照错位时退化为第一组，至少保证有内容可展示
+        for day in days:
+            group = _as_dict(_as_dict(day.get("groups")).get(kind))
+            if group:
+                return group
+        return {}
+
+    @staticmethod
+    def _calendar_card(card: Dict[str, Any], kind: str) -> Dict[str, Any]:
+        """追剧表卡片 -> 通用卡片字段，复用 _vod_from_card 的映射。"""
+        c = dict(card)
+        forecast = _as_dict(c.get("forecast"))
+        c["remarks"] = _first(c.get("latest_episode_label"),
+                              c.get("season_label"), forecast.get("label"))
+        c["update_status"] = _first(forecast.get("label"))
+        c["recent_update"] = _first(c.get("available_at"),
+                                    forecast.get("target_date"))
+        if not c.get("content_kind"):
+            c["content_kind"] = kind
+        return c
+
+    def _calendar_state(self, kind: str, today: str,
+                        weekday: int) -> Dict[str, Any]:
+        """取「日期+类型」的逐页状态；超过 TTL 或 weekday 变化时重建。"""
+        key = (self._host, today, kind)
+        now = time.time()
+        with self._calendar_lock:
+            for old in [k for k, v in self._calendar_states.items()
+                        if now - v.get("ts", 0.0) > _CALENDAR_TTL]:
+                self._calendar_states.pop(old, None)
+            state = self._calendar_states.get(key)
+            if not state or state.get("weekday") != weekday:
+                state = {
+                    "pages": {},          # page -> 该页 VOD（请求过即缓存）
+                    "cursors": {1: ""},  # page -> 请求该页所需 cursor，"" 为首页
+                    "seen": set(),        # 跨页 vod_id 去重
+                    "total": 0,           # 服务端给出的当天总数
+                    "exhausted": False,   # 已无下一页
+                    "weekday": weekday,
+                    "ts": now,
+                }
+                self._calendar_states[key] = state
+        return state
+
+    def _calendar_fetch_page(self, state: Dict[str, Any], page: int,
+                             limit: int, kind: str, today: str) -> bool:
+        """一个 TVBox 页 = 一次接口请求，limit 与每页条数一致，推进 cursor。"""
+        cursor = state["cursors"].get(page)
+        if cursor is None:
+            return False
+        weekday = _int(state.get("weekday"), 1)
+        params = {"week": "current", "kind": kind, "sort": "heat",
+                  "weekday": weekday, "view": "weekly", "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        obj, _ = self._http.request("GET", _CALENDAR_PATH, params)
+        # 仅首页校正 weekday：本地时钟与站点周快照跨周/错位时重建映射
+        if (page == 1 and not cursor and _as_list(_as_dict(obj).get("days"))
+                and not self._calendar_weekday(obj, today)):
+            probe, _ = self._http.request("GET", _CALENDAR_PATH, {
+                "week": "current", "kind": kind, "sort": "heat",
+                "view": "weekly", "limit": 4,
+            })
+            fixed = self._calendar_weekday(probe, today)
+            if fixed and fixed != weekday:
+                params["weekday"] = fixed
+                state["weekday"] = fixed
+                obj, _ = self._http.request("GET", _CALENDAR_PATH, params)
+        if not obj:
+            state["exhausted"] = True
+            return False
+        detail = _as_dict(_as_dict(obj).get("detail"))
+        group = self._calendar_group(obj, kind, today)
+        cards = [self._calendar_card(_as_dict(raw), kind)
+                 for raw in _as_list(group.get("preview"))]
+        vods = []
+        for vod in self._cards_to_vods(cards):
+            vid = _text(vod.get("vod_id"))
+            if vid and vid not in state["seen"]:
+                state["seen"].add(vid)
+                vods.append(vod)
+        state["pages"][page] = vods
+        total = _int(detail.get("total"), 0)
+        if total > 0:
+            state["total"] = total
+        next_cursor = _text(detail.get("next_cursor"))
+        if next_cursor and detail.get("has_more"):
+            state["cursors"][page + 1] = next_cursor
+        else:
+            state["exhausted"] = True
+        return True
+
+    def _calendar_content(self, extend: Any, page: int,
+                          limit: int) -> Dict[str, Any]:
+        """追剧表分页：今天 + 选定类型，一页对应一次接口请求，无本地切片。"""
+        kind = self._calendar_kind(extend)
+        today, weekday = self._calendar_day()
+        with self._calendar_lock:
+            state = self._calendar_state(kind, today, weekday)
+            # 跳页时按顺序补齐 cursor 链（顺带缓存中间页）；逐页滑动时目标页
+            # 的 cursor 已由上一页给出，直接 1 次请求返回该页 20 条
+            hops = 0
+            while (page not in state["cursors"] and not state["exhausted"]
+                   and hops < _CALENDAR_MAX_CHAIN_FETCHES):
+                prev_page = max(state["cursors"])
+                if (prev_page in state["pages"]
+                        and (prev_page + 1) not in state["cursors"]):
+                    break
+                if not self._calendar_fetch_page(state, prev_page, limit,
+                                                 kind, today):
+                    break
+                hops += 1
+            if page in state["cursors"] and page not in state["pages"]:
+                self._calendar_fetch_page(state, page, limit, kind, today)
+            page_vods = list(state["pages"].get(page) or [])
+            total = max(_int(state.get("total"), 0), len(page_vods))
+        if not page_vods and not total:
+            return _empty_page(page, limit)
+        return {
+            "list": page_vods,
+            "page": page,
+            "pagecount": int(math.ceil(total / float(limit))) if total > 0 else 0,
+            "limit": limit,
+            "total": total,
+        }
+
     # -- 列表 / 分类 / 搜索 -------------------------------------------------- #
 
     def _browse(self, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -1079,10 +1293,12 @@ class Spider(_BaseSpider):
         limit = self._page_size
         try:
             type_id = _text(tid)
+            # 「最近更新」走追剧表实现（原 updates 的
+            # /v1/browse/catalog?sort=updated_desc 逻辑已废弃）
+            if type_id in _CALENDAR_TIDS:
+                return self._calendar_content(extend, page, limit)
             params = {"page": page, "limit": limit}
-            if type_id == "updates":
-                params["sort"] = "updated_desc"
-            elif type_id == "recommend":
+            if type_id == "recommend":
                 params["sort"] = "trending"
                 params["window"] = "day"
             elif type_id in _KIND_IDS:
