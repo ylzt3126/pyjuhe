@@ -1,1753 +1,825 @@
-# -*- coding: utf-8 -*-
+# coding=utf-8
 """
-dongpian.ai (懂片帝AI) —— TVBox 采集模块（Python，仅依赖标准库）
-
-约定
-----
-入口类 Spider，方法签名与 TVBox / catvod 的 Spider 接口一致：
-    init(extend) / init(context, extend)
-    getName()
-    homeContent(filter)
-    homeVideoContent()
-    categoryContent(tid, pg, filter, extend)
-    detailContent(ids)
-    searchContent(key, quick, pg)
-    playerContent(flag, id, vipFlags)
-
-模块级同时导出同名函数（代理到默认 spider 实例），供不同 py 加载器调用。
-
-返回结构
---------
-homeContent      {"class": [...], "filters": {...}, "list": [...]}
-homeVideoContent {"list": [...]}
-categoryContent  {"list": [...], "page": int, "pagecount": int, "limit": int, "total": int}
-detailContent    {"list": [{...}]}
-searchContent    {"list": [...], "page": int, "pagecount": int, "limit": int, "total": int}
-playerContent    {"parse": 0, "play": "", "url": "...", "header": {...}, ...}
-
-所有公共方法均不抛出异常、不产生任何 stdout/stderr 输出；网络失败、异常响应、
-字段缺失、空结果一律退化为结构完整的空结果。直接执行本文件时做一次静默自检，
-以进程退出码表示结果（0 = 可用，1 = 不可用）。
-
-站点接口需要 HMAC-SHA256 请求签名：
-    message = METHOD + "\n" + pathname + search + "\n" + timestamp_ms + "\n" + nonce
-    headers = x-ai-movie-timestamp / x-ai-movie-nonce / x-ai-movie-signature
-分隔符为换行符而非空格，pathname+search 必须与最终请求的 URL 完全一致。
-
-最近更新
-----------------------
-「最近更新」(updates)数据来自网页 /updates 的「追剧周表」同源接口 GET /v1/watch-calendar，
-只取今天（Asia/Shanghai）当天、按 weekday + kind 拉取。接口支持 limit 与
-TVBox 每页条数一致（默认 20），因此一页对应一次请求，用 next_cursor 推进，
-电视剧 / 动漫 / 电影 / 综艺，未选择时默认电视剧。
-
-初始化与播放优选
-----------------
-1. 初始化阶段调用 /v1/users/password/login 建立会话：默认账号池共 10 个
-   （现有账号 + dongpianai01..dongpianai09，密码与账号同名），每次登录随机
-   取一个，失败自动换账号重试；可用 init({"account", "password"}) 固定单账号，
-   或 init({"accounts": [...]}) 自定义账号池。保存响应返回的 Set-Cookie，
-   并在之后所有接口请求头中统一携带该 Cookie；票据解析依赖此会话。
-2. 线路优选：优先识别 url_kind == "resolve_ticket" 的视频源。存在这类源时，
-   只保留并展示它们、过滤其余源，播放时通过
-   POST /v1/playback/resolve-line?view=compact 二次解析换取真实可播地址；
-   不存在票据源时，展示并使用其他视频源。
+目标站: 搜剧AI (souju.ai)
+模板: 影视聚合搜索 / 爬虫播放
+站点类型: 综合影视
+核心逻辑: HMAC-SHA256 签名 JSON API
+支持: 首页, 分类(含二级筛选), 搜索, 详情(多线路), 播放
 """
 
-import calendar
-import hashlib
-import hmac
-import json
-import math
-import re
-import secrets
 import sys
-import threading
+import json
 import time
-import urllib.error
+import hmac
+import hashlib
+import os
+import re
 import urllib.parse
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-from email.utils import parsedate_tz
-from typing import Any, Dict, List, Optional, Tuple
 
-# 播放端（TVBox / catvod 系）的 Spider 是抽象基类，采集器需要继承它才算合规实现。
-# 找不到 base 模块时（例如本地直接 python 运行）退化为普通 object，不影响自检。
-try:  # pragma: no cover
-    if ".." not in sys.path:
-        sys.path.append("..")
-    from base.spider import Spider as _BaseSpider  # type: ignore
-except Exception:  # pragma: no cover
-    _BaseSpider = object
+sys.path.append('..')
+from base.spider import Spider
 
-__all__ = [
-    "Spider", "spider", "init", "getName", "homeContent", "homeVideoContent",
-    "categoryContent", "detailContent", "searchContent", "playerContent",
-]
+# 只保留 url_kind == "resolve_ticket" 的官方线路。
+# 部分长尾片源（老片/冷门片）整条记录都没有官方线路，只有第三方 m3u8；
+# 此时若不回退，该记录会完全无法播放。置为 False 则严格只显示官方线路。
+DIRECT_FALLBACK_WHEN_NO_TICKET = True
 
-# --------------------------------------------------------------------------- #
-# 站点常量（可通过 init(extend) 覆盖）
-# --------------------------------------------------------------------------- #
-
-# _DEFAULT_HOST = "https://dongpian.ai"
-_DEFAULT_HOST = "https://dongpian25.com"
-_DEFAULT_SIGN_KEY = "8b9a908a05eac640e1ee06f52acaa741bfe4ba9e004eeffdbeb635e532e06666"
-_DEFAULT_BUILD_VERSION = "dongpiandi-v2026.11.02.1-player-pause-gateway-464465fce4f1-web"
-_CLIENT_NAME = "movie-search-frontend"
-_CLIENT_VERSION = "1.0.0"
-_PROTOCOL_VERSION = "2026-07-05.library-v2.playback-v1"
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-)
-
-# 初始化登录（账号与密码一致；可通过 init(extend) 的 account/password 覆盖）
-_DEFAULT_ACCOUNT = "dongpian3126"
-_DEFAULT_PASSWORD = "dongpian3126"
-_LOGIN_PATH = "/v1/users/password/login"
-_RESOLVE_LINE_PATH = "/v1/playback/resolve-line?view=compact"
-_LOGIN_RETRY_INTERVAL = 60.0
-_LOGIN_ACCOUNT_ATTEMPTS = 3
-
-# 默认账号池：现有 1 个 + dongpianai01..dongpianai09，共 10 个，密码与账号同名
-_ACCOUNT_POOL = tuple(
-    [(_DEFAULT_ACCOUNT, _DEFAULT_PASSWORD)]
-    + [("dongpianai%02d" % i,) * 2 for i in range(1, 10)]
-)
-
-# 进程内共享缓存：跨 Spider 实例复用静态配置与首页快照，按 host 隔离；不写磁盘
-_SHARED_CACHE = {}          # type: Dict[str, Tuple[Any, float]]
-_SHARED_CACHE_LOCK = threading.RLock()
-
-_KIND_LABELS = {
-    "movie": "电影",
-    "series": "电视剧",
-    "anime": "动漫",
-    "variety": "综艺",
-    "short_drama": "短剧",
-    "documentary": "纪录片",
-    "sports": "体育",
-}
-_KIND_IDS = tuple(_KIND_LABELS.keys())
-
-_FALLBACK_CATEGORIES = [
-    {"type_id": "recommend", "type_name": "AI找剧"},
-    {"type_id": "updates", "type_name": "最近更新"},
-    {"type_id": "series", "type_name": "电视剧"},
-    {"type_id": "movie", "type_name": "电影"},
-    {"type_id": "anime", "type_name": "动漫"},
-    {"type_id": "variety", "type_name": "综艺"},
-    {"type_id": "short_drama", "type_name": "短剧"},
-]
-
-# ---- 最近更新实现 -------------------------------------------------- #
-_CALENDAR_TIDS = ("updates",)
-_CALENDAR_PATH = "/v1/watch-calendar"
-_CALENDAR_DEFAULT_KIND = "series"
-# 顺序即筛选面板顺序：第一项「电视剧」同时是未选择时的默认类型
-_CALENDAR_KINDS = (
-    ("series", "电视剧"),
-    ("anime", "动漫"),
-    ("movie", "电影"),
-    ("variety", "综艺"),
-)
-_CALENDAR_KIND_IDS = tuple(k for k, _ in _CALENDAR_KINDS)
-_CALENDAR_FILTERS = [
-    {"key": "cal_kind", "name": "类型", "value": [
-        {"n": label, "v": kind} for kind, label in _CALENDAR_KINDS
-    ]},
-]
-# 一页一次请求，limit 直接取 TVBox 的每页条数；跳页时最多顺序补齐 30 页
-# 的 cursor 链，防止异常快照下无限翻页
-_CALENDAR_MAX_CHAIN_FETCHES = 30
-_CALENDAR_TTL = 300.0
-
-_FALLBACK_FILTERS = [
-    {"key": "genre", "name": "类型", "value": [
-        {"n": "全部", "v": ""},
-        {"n": "喜剧", "v": "喜剧"}, {"n": "爱情", "v": "爱情"},
-        {"n": "动作", "v": "动作"}, {"n": "科幻", "v": "科幻"},
-        {"n": "悬疑", "v": "悬疑"}, {"n": "剧情", "v": "剧情"},
-    ]},
-    {"key": "area", "name": "地区", "value": [
-        {"n": "全部", "v": ""},
-        {"n": "大陆", "v": "中国大陆"}, {"n": "中国香港", "v": "中国香港"},
-        {"n": "中国台湾", "v": "中国台湾"}, {"n": "日本", "v": "日本"},
-        {"n": "韩国", "v": "韩国"}, {"n": "欧美", "v": "欧美"},
-    ]},
-    {"key": "year", "name": "年份", "value": [
-        {"n": "全部", "v": ""},
-        {"n": "2026", "v": "2026"}, {"n": "2025", "v": "2025"},
-        {"n": "2024", "v": "2024"},
-    ]},
-    {"key": "sort", "name": "排序", "value": [
-        {"n": "默认", "v": ""},
-        {"n": "最新", "v": "updated_desc"}, {"n": "最热", "v": "heat_desc"},
-    ]},
-]
-
-# 筛选行的显示名：站点给 genre 行下发的是"分类"，部分播放端的筛选面板对这一行
-# 不渲染行名（会留空），统一换成通用叫法"类型"，与参考实现一致，保证行名必显示。
-_ROW_LABELS = {
-    "genre": "类型",
-    "area": "地区",
-    "language": "语言",
-    "year": "年份",
-    "sort": "排序",
-    "status": "状态",
-    "orientation": "形式",
-}
-
-# 允许透传给 /v1/browse/catalog 的筛选参数（防止 extend 注入无关参数破坏签名语义）
-_FILTER_KEYS = {
-    "genre", "area", "language", "year", "year_gte", "year_lte",
-    "sort", "status", "orientation", "q",
-}
-_MAX_PAGES = 10000
-_MAX_EPISODE_PAGES = 30
-_MAX_LINES = 12
+# ---------------- 账号会话（全部内联，运行期不写任何文件） ----------------
+# 站点官方线路第 1 集免费，第 2 集起要求登录（playback_user_session_required）。
+# 下面三项就是默认凭据：Cookie 失效时会用账号密码自动重登，新会话只存在内存里。
+# 站点按 ai_movie_browser 设备号维度维护会话，同设备重复登录会顶掉旧会话，
+# 这里固定使用爬虫自己的设备号，避免把浏览器上的登录态挤下线。
+DEFAULT_ACCOUNT = 'souju3126'
+DEFAULT_PASSWORD = 'souju3126'
+DEFAULT_DEVICE_ID = 'brw_PrZeOSXqyokMJK1cpOYdFbP4DRJFlkTI6jbGvQFs6g4'
+DEFAULT_COOKIE = ('ai_movie_session=ums_hptqvUfGsu50tHYc90nztL38MDC9ehmm8kTLySpRT-Q; '
+                  'ai_movie_browser=' + DEFAULT_DEVICE_ID)
 
 
-# --------------------------------------------------------------------------- #
-# 通用安全工具
-# --------------------------------------------------------------------------- #
+class Spider(Spider):
+    def init(self, extend=""):
+        self.site_url = "https://souju.ai"
+        self.api_secret = "f39d73aa7a6426203cdee1ef17b31d3b7ea8c23f4c59c62a3a8aa0f39ee5e79d"
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'Referer': self.site_url + '/',
+            'Origin': self.site_url,
+        }
+        self.default_pic = 'https://pic.rmb.bdstatic.com/bjh/user/default.png'
+        # 会话来源优先级：配置项 cookie > 内置 DEFAULT_COOKIE；
+        # 账号密码同理（配置项 > 内置），用于 Cookie 失效时自动重登。
+        cookie, account, password = self._pick_credentials(extend)
+        self._account = account or DEFAULT_ACCOUNT
+        self._password = password or DEFAULT_PASSWORD
+        self._device_id = DEFAULT_DEVICE_ID
+        cookie = cookie or DEFAULT_COOKIE
+        if cookie:
+            self.headers['Cookie'] = cookie
+        self.categories = {
+            'movie': '电影',
+            'series': '电视剧',
+            'anime': '动漫',
+            'variety': '综艺',
+            'short_drama': '短剧',
+        }
+        self.filters = {
+            'movie': [
+                {'key': 'genre', 'name': '类型', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '动作', 'v': '动作'}, {'n': '喜剧', 'v': '喜剧'},
+                    {'n': '爱情', 'v': '爱情'}, {'n': '科幻', 'v': '科幻'}, {'n': '恐怖', 'v': '恐怖'},
+                    {'n': '剧情', 'v': '剧情'}, {'n': '战争', 'v': '战争'}, {'n': '动画', 'v': '动画'},
+                    {'n': '悬疑', 'v': '悬疑'}, {'n': '犯罪', 'v': '犯罪'}, {'n': '冒险', 'v': '冒险'},
+                ]},
+                {'key': 'region', 'name': '地区', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '中国大陆', 'v': '中国大陆'}, {'n': '中国香港', 'v': '中国香港'},
+                    {'n': '中国台湾', 'v': '中国台湾'}, {'n': '美国', 'v': '美国'}, {'n': '韩国', 'v': '韩国'},
+                    {'n': '日本', 'v': '日本'}, {'n': '英国', 'v': '英国'}, {'n': '法国', 'v': '法国'},
+                    {'n': '印度', 'v': '印度'}, {'n': '泰国', 'v': '泰国'},
+                ]},
+                {'key': 'year', 'name': '年份', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '2026', 'v': '2026'}, {'n': '2025', 'v': '2025'},
+                    {'n': '2024', 'v': '2024'}, {'n': '2023', 'v': '2023'}, {'n': '2022', 'v': '2022'},
+                    {'n': '2021', 'v': '2021'}, {'n': '2020', 'v': '2020'}, {'n': '2019', 'v': '2019'},
+                    {'n': '2018', 'v': '2018'}, {'n': '更早', 'v': '2010_2017'},
+                ]},
+                {'key': 'sort', 'name': '排序', 'value': [
+                    {'n': '最新', 'v': 'newest'}, {'n': '最热', 'v': 'hottest'}, {'n': '好评', 'v': 'rating'},
+                ]},
+            ],
+            'series': [
+                {'key': 'genre', 'name': '类型', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '古装', 'v': '古装'}, {'n': '都市', 'v': '都市'},
+                    {'n': '悬疑', 'v': '悬疑'}, {'n': '武侠', 'v': '武侠'}, {'n': '科幻', 'v': '科幻'},
+                    {'n': '战争', 'v': '战争'}, {'n': '喜剧', 'v': '喜剧'}, {'n': '爱情', 'v': '爱情'},
+                    {'n': '家庭', 'v': '家庭'}, {'n': '历史', 'v': '历史'}, {'n': '谍战', 'v': '谍战'},
+                ]},
+                {'key': 'region', 'name': '地区', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '中国大陆', 'v': '中国大陆'}, {'n': '韩国', 'v': '韩国'},
+                    {'n': '美国', 'v': '美国'}, {'n': '日本', 'v': '日本'}, {'n': '中国香港', 'v': '中国香港'},
+                    {'n': '中国台湾', 'v': '中国台湾'}, {'n': '英国', 'v': '英国'},
+                ]},
+                {'key': 'year', 'name': '年份', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '2026', 'v': '2026'}, {'n': '2025', 'v': '2025'},
+                    {'n': '2024', 'v': '2024'}, {'n': '2023', 'v': '2023'}, {'n': '2022', 'v': '2022'},
+                    {'n': '2021', 'v': '2021'}, {'n': '2020', 'v': '2020'}, {'n': '2019', 'v': '2019'},
+                ]},
+                {'key': 'status', 'name': '状态', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '连载', 'v': 'ongoing'}, {'n': '完结', 'v': 'completed'},
+                ]},
+            ],
+            'anime': [
+                {'key': 'genre', 'name': '类型', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '热血', 'v': '热血'}, {'n': '恋爱', 'v': '恋爱'},
+                    {'n': '校园', 'v': '校园'}, {'n': '奇幻', 'v': '奇幻'}, {'n': '科幻', 'v': '科幻'},
+                    {'n': '搞笑', 'v': '搞笑'}, {'n': '冒险', 'v': '冒险'}, {'n': '运动', 'v': '运动'},
+                ]},
+                {'key': 'region', 'name': '地区', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '日本', 'v': '日本'}, {'n': '中国', 'v': '中国'},
+                    {'n': '欧美', 'v': '欧美'}, {'n': '韩国', 'v': '韩国'},
+                ]},
+                {'key': 'year', 'name': '年份', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '2026', 'v': '2026'}, {'n': '2025', 'v': '2025'},
+                    {'n': '2024', 'v': '2024'}, {'n': '2023', 'v': '2023'}, {'n': '2022', 'v': '2022'},
+                ]},
+            ],
+            'variety': [
+                {'key': 'region', 'name': '地区', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '中国大陆', 'v': '中国大陆'}, {'n': '韩国', 'v': '韩国'},
+                    {'n': '中国台湾', 'v': '中国台湾'}, {'n': '美国', 'v': '美国'}, {'n': '日本', 'v': '日本'},
+                ]},
+                {'key': 'year', 'name': '年份', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '2026', 'v': '2026'}, {'n': '2025', 'v': '2025'},
+                    {'n': '2024', 'v': '2024'}, {'n': '2023', 'v': '2023'},
+                ]},
+            ],
+            'short_drama': [
+                {'key': 'genre', 'name': '类型', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '都市', 'v': '都市'}, {'n': '古装', 'v': '古装'},
+                    {'n': '逆袭', 'v': '逆袭'}, {'n': '甜宠', 'v': '甜宠'}, {'n': '赘婿', 'v': '赘婿'},
+                ]},
+                {'key': 'year', 'name': '年份', 'value': [
+                    {'n': '全部', 'v': ''}, {'n': '2026', 'v': '2026'}, {'n': '2025', 'v': '2025'}, {'n': '2024', 'v': '2024'},
+                ]},
+            ],
+        }
 
-def _as_dict(value: Any) -> Dict[str, Any]:
-    return value if isinstance(value, dict) else {}
+    # ---------------- 会话：配置解析 / 本地缓存 / 账号登录 ----------------
 
-
-def _as_list(value: Any) -> List[Any]:
-    return value if isinstance(value, list) else []
-
-
-def _text(value: Any, default: str = "") -> str:
-    if value is None:
-        return default
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, bool):
-        return default
-    if isinstance(value, (int, float)):
-        return str(value)
-    return default
-
-
-def _int(value: Any, default: int = 0) -> int:
-    try:
-        if isinstance(value, bool) or value is None:
-            return default
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
-
-
-def _positive(value: Any, default: int, ceiling: int = 100) -> int:
-    n = _int(value, default)
-    if n < 1:
-        n = default
-    return min(n, ceiling)
-
-
-def _normalize_accounts(value: Any) -> Tuple[Tuple[str, str], ...]:
-    """把 list/tuple/dict/字符串形式的账号配置规范化为 ((账号, 密码), ...)。"""
-    if not isinstance(value, (list, tuple)):
-        return ()
-    out = []
-    for item in value:
-        account, password = "", ""
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            account, password = _text(item[0]), _text(item[1])
-        elif isinstance(item, dict):
-            account = _text(item.get("account") or item.get("username"))
-            password = _text(item.get("password")) or account
-        elif isinstance(item, str):
-            account = _text(item)
-            password = account
-        if account and password and (account, password) not in out:
-            out.append((account, password))
-    return tuple(out)
-
-
-def _first(*values: Any) -> str:
-    for v in values:
-        s = _text(v)
-        if s:
-            return s
-    return ""
-
-
-def _names(value: Any, limit: int = 0) -> List[str]:
-    out = []
-    for item in _as_list(value):
-        s = _text(item)
-        if s and s not in out:
-            out.append(s)
-    if limit > 0:
-        out = out[:limit]
-    return out
-
-
-def _piece(value: Any) -> str:
-    """清洗为 TVBox 播放列表安全的片段（不含 $ # 与换行）。"""
-    s = _text(value)
-    s = re.sub(r"[\r\n\t]+", " ", s)
-    s = s.replace("$", "").replace("#", "")
-    return s.strip()
-
-
-def _absolute(url: Any, host: str) -> str:
-    u = _text(url)
-    if not u:
-        return ""
-    if u.startswith("//"):
-        return "https:" + u
-    if u.startswith("http://") or u.startswith("https://"):
-        return u
-    if u.startswith("/"):
-        return host + u
-    return ""
-
-
-def _date_only(value: Any) -> str:
-    s = _text(value)
-    if not s:
-        return ""
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
-    return m.group(1) if m else s[:19]
-
-
-def _quote(value: Any) -> str:
-    return urllib.parse.quote(_text(value), safe="-_.~")
-
-
-def _parse_extend(value: Any) -> Dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        s = value.strip()
-        if s.startswith("{"):
+    @staticmethod
+    def _as_params(extend):
+        """把配置项统一解析成 dict：支持 dict / JSON / 查询串。
+        注意 Cookie 值自身含 ';'，所以只按 '&' 切分，避免把 Cookie 截断。"""
+        if not extend:
+            return {}
+        if isinstance(extend, dict):
+            return dict(extend)
+        s = str(extend).strip()
+        if not s:
+            return {}
+        if s.startswith('{'):
             try:
                 obj = json.loads(s)
-                if isinstance(obj, dict):
-                    return obj
-            except (ValueError, TypeError):
-                pass
-    return {}
+                return obj if isinstance(obj, dict) else {}
+            except Exception:
+                return {}
+        out = {}
+        for part in s.split('&'):
+            if '=' in part:
+                k, v = part.split('=', 1)
+                out[k.strip().lower()] = urllib.parse.unquote(v.strip())
+        return out
 
+    @classmethod
+    def _pick_credentials(cls, extend):
+        """返回 (cookie, account, password)。"""
+        p = cls._as_params(extend)
+        cookie = p.get('cookie') or ''
+        account = p.get('account') or p.get('user') or p.get('username') or ''
+        password = p.get('password') or p.get('pass') or p.get('pwd') or ''
+        if not cookie and not account and not password:
+            # 没识别出任何已知键时，才把整串当作裸 Cookie
+            s = str(extend or '').strip()
+            if s and not s.startswith(('{', '[')) and '=' in s:
+                cookie = s
+        return cls._clean_cookie(cookie), account.strip(), password.strip()
 
-def _single_value(value: Any) -> str:
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            s = _text(item)
-            if s:
-                return s
-        return ""
-    return _text(value)
+    @staticmethod
+    def _clean_cookie(raw):
+        if not isinstance(raw, str):
+            return ''
+        raw = raw.strip()
+        if raw.lower().startswith('cookie:'):
+            raw = raw[7:].strip()
+        raw = raw.replace('\r', '').replace('\n', '')
+        # 配置位有时被填成接口地址等非 Cookie 内容，做基本校验避免污染请求头
+        if '=' not in raw or '://' in raw or len(raw) > 4096:
+            return ''
+        return raw
 
-
-def _is_http(value: Any) -> bool:
-    u = _text(value)
-    return u.startswith("http://") or u.startswith("https://")
-
-
-def _is_direct_line(line: Dict[str, Any]) -> bool:
-    """线路是否已经是可直接播放的真实 URL。"""
-    if not _is_http(line.get("url")):
-        return False
-    if line.get("resolved") is True:
-        return True
-    if line.get("resolve_required") is False:
-        return True
-    if _text(line.get("resolve_mode")) == "direct":
-        return True
-    if _text(line.get("url_kind")) in ("m3u8", "mp4", "url", "direct"):
-        return True
-    return False
-
-
-def _encode_filter(params: Dict[str, Any], key: str) -> str:
-    """筛选项 -> TVBox 的 v 值；多参数项编码为 query 串，由 categoryContent 还原。"""
-    items = [(k, _text(v)) for k, v in params.items() if _text(k) and _text(v)]
-    if not items:
-        return ""
-    if len(items) == 1 and items[0][0] == key:
-        return items[0][1]
-    return urllib.parse.urlencode(items)
-
-
-def _clone_filter_rows(rows: Any) -> List[Dict[str, Any]]:
-    """把筛选定义深拷贝成一份全新对象（行/选项都不共享引用）。
-
-    TVBox 系播放端按 type_id 取 filters；若多个分类指向同一个 list 对象，
-    部分端在 Python -> Java -> JSON 的递归转换阶段会合并重复引用甚至丢弃，
-    表现就是分类页的筛选条件显示不出来。因此每个分类必须各持一份独立副本。
-    """
-    out = []          # type: List[Dict[str, Any]]
-    seen_keys = set()
-    for raw_row in _as_list(rows):
-        row = _as_dict(raw_row)
-        key = _text(row.get("key"))
-        if not key or key in seen_keys:
-            continue
-        values = []   # type: List[Dict[str, str]]
-        names = set()
-        for raw_opt in _as_list(row.get("value")):
-            opt = _as_dict(raw_opt)
-            label = _text(opt.get("n"))
-            if not label or label in names:
-                continue
-            names.add(label)
-            values.append({"n": label, "v": _text(opt.get("v"))})
-        if len(values) < 2:
-            continue
-        seen_keys.add(key)
-        out.append({"key": key,
-                    "name": _ROW_LABELS.get(key) or _first(row.get("name"), key),
-                    "value": values})
-    return out
-
-
-def _empty_page(page: int = 1, limit: int = 20) -> Dict[str, Any]:
-    return {"list": [], "page": page, "pagecount": 0, "limit": limit, "total": 0}
-
-
-def _empty_detail() -> Dict[str, Any]:
-    return {"list": []}
-
-
-def _empty_player(flag: str = "", vid: str = "") -> Dict[str, Any]:
-    return {
-        "parse": 0,
-        "play": "",
-        "url": "",
-        "header": {},
-        "contentType": "",
-        "danmaku": "",
-        "subs": [],
-        "flag": flag,
-        "id": vid,
-    }
-
-
-# --------------------------------------------------------------------------- #
-# 签名 HTTP 客户端
-# --------------------------------------------------------------------------- #
-
-class _Http(object):
-    def __init__(self, host: str, key: str, build_version: str,
-                 timeout: float, retries: int,
-                 account: str = "", password: str = "",
-                 accounts: Any = None) -> None:
-        self.host = (host or _DEFAULT_HOST).rstrip("/")
-        self.key = key or _DEFAULT_SIGN_KEY
-        self.build_version = build_version or _DEFAULT_BUILD_VERSION
-        self.timeout = float(timeout) if timeout and float(timeout) > 0 else 12.0
-        self.retries = max(0, min(3, _int(retries, 1)))
-        explicit_account = _text(account)
-        explicit_password = _text(password)
-        if explicit_account and explicit_password:
-            self.accounts = ((explicit_account, explicit_password),)
-        else:
-            self.accounts = _normalize_accounts(accounts) or _ACCOUNT_POOL
-        # 登录返回的 cookie 统一保存在这里，并由 _base_headers 注入每次请求头
-        self._cookie_map = {}    # type: Dict[str, str]
-        self._auth_cookie = ""
-        self._login_lock = threading.RLock()
-        self._login_state = 0    # 0 未尝试 / 1 成功 / -1 失败
-        self._login_at = 0.0
-        # 不使用 CookieProcessor，避免与统一注入的 Cookie 头产生重复
-        self._opener = urllib.request.build_opener()
-        self._clock_offset = 0.0
-        self._lock = threading.RLock()
-        self._cache = _SHARED_CACHE
-        self._cache_lock = _SHARED_CACHE_LOCK
-
-    # -- 登录与会话 cookie ---------------------------------------------------- #
-
-    def _absorb_cookies(self, headers: Any) -> None:
-        """保存响应中的 Set-Cookie（同名覆盖，空值/Max-Age=0 视为清除）。"""
-        try:
-            raw_list = headers.get_all("Set-Cookie") if headers else None
-        except Exception:
-            raw_list = None
-        if not raw_list:
-            return
-        with self._lock:
-            changed = False
-            for raw in raw_list:
+    @staticmethod
+    def _parse_set_cookie(resp):
+        """从响应里取会话 Cookie。
+        不同内核的 headers 行为不一致（多值 / 逗号拼接 / 单个字符串），
+        这里统一拼成文本后按 ai_movie_* 名逐个匹配，后出现的非空值生效。"""
+        hdrs = getattr(resp, 'headers', None)
+        if hdrs is None:
+            return {}
+        chunks = []
+        for getter in ('getlist', 'get_all'):
+            fn = getattr(hdrs, getter, None)
+            if callable(fn):
                 try:
-                    first = str(raw).split(";", 1)[0].strip()
-                    if "=" not in first:
-                        continue
-                    name, value = first.split("=", 1)
-                    name, value = name.strip(), value.strip()
-                    if not name:
-                        continue
-                    if value:
-                        self._cookie_map[name] = value
-                    else:
-                        self._cookie_map.pop(name, None)
-                    changed = True
+                    chunks.extend([str(x) for x in (fn('Set-Cookie') or [])])
                 except Exception:
-                    continue
-            if changed:
-                self._auth_cookie = "; ".join(
-                    "%s=%s" % (k, v) for k, v in self._cookie_map.items() if v
-                )
-
-    def ensure_login(self, force: bool = False) -> bool:
-        """从账号池随机取一个登录；失败自动换账号重试，绝不抛异常。"""
-        with self._login_lock:
-            if self._login_state == 1 and self._auth_cookie:
-                return True
-            now = time.time()
-            if not force and now - self._login_at < _LOGIN_RETRY_INTERVAL:
-                return False
-            self._login_at = now
-        order = list(self.accounts or _ACCOUNT_POOL)
-        try:
-            secrets.SystemRandom().shuffle(order)
-        except Exception:
-            pass
-        ok = False
-        for account, password in order[:_LOGIN_ACCOUNT_ATTEMPTS]:
-            try:
-                obj, status = self.request(
-                    "POST", _LOGIN_PATH,
-                    body={"account": account, "password": password},
-                    need_auth=False, timeout=min(self.timeout, 8.0),
-                )
-                if status in (200, 201) and obj and self._auth_cookie:
-                    ok = True
-                    break
-            except Exception:
-                continue
-        with self._login_lock:
-            self._login_state = 1 if ok else -1
-        return ok
-
-    @staticmethod
-    def _cache_key(key: str, host: str) -> str:
-        return host + "|" + key
-
-    def invalidate(self, key: str) -> None:
-        with self._cache_lock:
-            self._cache.pop(self._cache_key(key, self.host), None)
-
-    # -- 时钟 ---------------------------------------------------------------- #
-
-    def _apply_date(self, headers: Any) -> None:
-        try:
-            raw = headers.get("Date") if headers else None
-            if not raw:
-                return
-            parsed = parsedate_tz(raw)
-            if not parsed:
-                return
-            server_ts = calendar.timegm(parsed[:9])
-            offset = server_ts - time.time()
-            if abs(offset) < 86400:
-                with self._lock:
-                    self._clock_offset = offset
-        except Exception:
-            pass
-
-    def _sync_clock(self) -> None:
-        """失败/401 时用无签名接口重新对齐服务器时间。"""
-        try:
-            sync_headers = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
-            if self._auth_cookie:
-                sync_headers["Cookie"] = self._auth_cookie
-            req = urllib.request.Request(
-                self.host + "/v1/runtime/bootstrap", headers=sync_headers,
-            )
-            resp = self._opener.open(req, timeout=min(self.timeout, 8.0))
-            try:
-                self._apply_date(resp.headers)
-                resp.read(64)
-            finally:
-                resp.close()
-        except Exception:
-            pass
-
-    def now(self) -> float:
-        """按服务器 Date 头校正过的当前时间（Unix 秒），供日期类业务使用。"""
-        with self._lock:
-            return time.time() + self._clock_offset
-
-    def _timestamp(self) -> str:
-        return str(int(self.now() * 1000))
-
-    # -- 请求 ---------------------------------------------------------------- #
-
-    def _base_headers(self, signed: bool) -> Dict[str, str]:
-        headers = {
-            "User-Agent": _USER_AGENT,
-            "Accept": "application/json",
-            "Referer": self.host + "/",
-            "Origin": self.host,
-            "x-ai-movie-client-name": _CLIENT_NAME,
-            "x-ai-movie-client-version": _CLIENT_VERSION,
-            "x-ai-movie-build-version": self.build_version,
-            "x-ai-movie-protocol-version": _PROTOCOL_VERSION,
-        }
-        cookie = self._auth_cookie
-        if cookie:
-            headers["Cookie"] = cookie
-        return headers
-
-    def _signature(self, method: str, path: str) -> Dict[str, str]:
-        ts = self._timestamp()
-        nonce = secrets.token_hex(16)
-        message = "\n".join((method.upper(), path, ts, nonce))
-        signature = hmac.new(
-            self.key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
-        return {
-            "x-ai-movie-timestamp": ts,
-            "x-ai-movie-nonce": nonce,
-            "x-ai-movie-signature": signature,
-        }
-
-    @staticmethod
-    def _build_path(path: str, params: Optional[Dict[str, Any]]) -> str:
-        if not params:
-            return path
-        items = []
-        for key, value in params.items():
-            if key is None or value is None:
-                continue
-            if isinstance(value, (list, tuple)):
-                for sub in value:
-                    if sub is not None and _text(sub):
-                        items.append((_text(key), _text(sub)))
-            else:
-                s = _text(value)
-                if s:
-                    items.append((_text(key), s))
-        if not items:
-            return path
-        sep = "&" if "?" in path else "?"
-        return path + sep + urllib.parse.urlencode(items)
-
-    def request(self, method: str, path: str,
-                params: Optional[Dict[str, Any]] = None,
-                body: Any = None, signed: bool = True,
-                timeout: Optional[float] = None,
-                need_auth: bool = True) -> Tuple[Dict[str, Any], int]:
-        """返回 (JSON 对象, HTTP 状态码)；任何失败返回 ({}, code 或 0)。"""
-        if need_auth and signed:
-            self.ensure_login()
-        full_path = self._build_path(path, params)
-        url = self.host + full_path
-        method = (method or "GET").upper()
-        attempts = self.retries + 1
-        status = 0
-        for attempt in range(attempts):
-            try:
-                headers = self._base_headers(signed)
-                if signed:
-                    headers.update(self._signature(method, full_path))
-                data = None
-                if body is not None:
-                    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-                    headers["Content-Type"] = "application/json"
-                req = urllib.request.Request(url, data=data, headers=headers, method=method)
-                resp = self._opener.open(req, timeout=timeout or self.timeout)
-                try:
-                    status = _int(getattr(resp, "status", 0), 0) or _int(resp.getcode(), 0)
-                    self._apply_date(resp.headers)
-                    self._absorb_cookies(resp.headers)
-                    raw = resp.read(8 * 1024 * 1024)
-                finally:
-                    resp.close()
-                if not raw:
-                    return {}, status or 204
-                obj = json.loads(raw.decode("utf-8", "replace"))
-                if not isinstance(obj, dict):
-                    return {}, status or 200
-                return obj, status or 200
-            except urllib.error.HTTPError as exc:
-                status = _int(exc.code, 0)
-                self._apply_date(exc.headers)
-                self._absorb_cookies(exc.headers)
-                if status == 401 and signed:
-                    self._sync_clock()
-                if status in (401, 403) and signed and need_auth:
-                    # 会话可能已失效：重置登录状态并重新登录后再重试
-                    with self._login_lock:
-                        self._login_state = 0
-                        self._login_at = 0.0
-                    self.ensure_login(force=True)
-                if attempt + 1 < attempts and status in (401, 403, 408, 429, 500, 502, 503, 504):
-                    continue
-                return {}, status
-            except Exception:
-                if attempt + 1 < attempts:
-                    if signed:
-                        self._sync_clock()
-                    continue
-                return {}, 0
-        return {}, status
-
-    # -- 简单 TTL 缓存 ------------------------------------------------------- #
-
-    def cached(self, key: str, ttl: float, producer) -> Any:
-        now = time.time()
-        cache_key = self._cache_key(key, self.host)
-        with self._cache_lock:
-            hit = self._cache.get(cache_key)
-            if hit and hit[1] > now:
-                return hit[0]
-        try:
-            value = producer()
-        except Exception:
-            value = None
-        if value is None:
-            value = {}
-        # 空/失败结果只做极短缓存，避免故障期间长时间不可用
-        effective = ttl if value else min(ttl, 8.0)
-        with self._cache_lock:
-            if len(self._cache) > 256:
-                for k in [k for k, v in self._cache.items() if v[1] <= now]:
-                    self._cache.pop(k, None)
-            self._cache[cache_key] = (value, now + effective)
-        return value
-
-    def peek(self, key: str) -> Any:
-        """只读缓存，绝不发起网络请求（用于不能被网络阻塞的路径）。"""
-        now = time.time()
-        cache_key = self._cache_key(key, self.host)
-        with self._cache_lock:
-            hit = self._cache.get(cache_key)
-            if hit and hit[1] > now:
-                return hit[0]
-        return None
-
-
-# --------------------------------------------------------------------------- #
-# 采集主体
-# --------------------------------------------------------------------------- #
-
-class Spider(_BaseSpider):
-
-    def __init__(self, extend: Any = None) -> None:
-        self._host = _DEFAULT_HOST
-        self._key = _DEFAULT_SIGN_KEY
-        self._build_version = _DEFAULT_BUILD_VERSION
-        self._timeout = 12.0
-        self._retries = 1
-        self._page_size = 20
-        self._home_deadline = 4.0
-        self._account = ""
-        self._password = ""
-        self._accounts = _ACCOUNT_POOL
-        self._cfg = self._config_snapshot()
-        self._http = self._new_http()
-        self._meta = {}          # vod_id -> 列表卡片原始信息（补全详情缺失字段）
-        self._meta_lock = threading.RLock()
-        # 按需懒加载状态：(host, 今天, 类型) -> 已拉取条目 + 下一批 cursor
-        self._calendar_states = {}   # type: Dict[Any, Dict[str, Any]]
-        self._calendar_lock = threading.RLock()
-        # 构造阶段只建状态，不做任何网络请求：模块 import 就可能 new 一个实例，
-        # 若在这里同步登录，弱网/被墙时整个采集器会卡住甚至 import 失败，
-        # 播放端拿不到 homeContent，分类标签就会一个都不显示。
-        # 登录改为首个真实请求时按需完成（见 _Http.request）。
-        if extend is not None:
-            self.init(extend)
-
-    def _config_snapshot(self) -> Dict[str, Any]:
-        return {
-            "host": self._host,
-            "key": self._key,
-            "build_version": self._build_version,
-            "timeout": self._timeout,
-            "retries": self._retries,
-            "account": self._account,
-            "password": self._password,
-            "accounts": self._accounts,
-        }
-
-    def _new_http(self) -> _Http:
-        return _Http(self._host, self._key, self._build_version,
-                     self._timeout, self._retries,
-                     self._account, self._password, self._accounts)
-
-    # -- 生命周期 ------------------------------------------------------------ #
-
-    def init(self, *args: Any, **kwargs: Any) -> str:
-        ext = None
-        for arg in args:
-            if isinstance(arg, dict):
-                ext = arg
+                    pass
                 break
-            if isinstance(arg, str) and arg.strip().startswith("{"):
-                parsed = _parse_extend(arg)
-                if parsed:
-                    ext = parsed
-                    break
-        if ext is None:
-            ext = _parse_extend(kwargs.get("extend") or kwargs.get("cfg"))
-        self._host = _text(ext.get("host"), _DEFAULT_HOST).rstrip("/") or _DEFAULT_HOST
-        self._key = _text(ext.get("key") or ext.get("sign_key"), _DEFAULT_SIGN_KEY)
-        self._build_version = _text(
-            ext.get("build_version") or ext.get("build"), _DEFAULT_BUILD_VERSION
-        )
-        self._timeout = float(_text(ext.get("timeout"), "12") or "12")
-        self._retries = _int(ext.get("retries"), 1)
-        self._page_size = _positive(ext.get("page_size"), 20, 50)
-        # 首页预热的最长等待时间：超时只影响首页影片列表，不影响分类/筛选
-        self._home_deadline = max(2.0, min(15.0, _positive(ext.get("home_deadline"), 4, 15) or 6.0))
-        self._account = _text(ext.get("account") or ext.get("username"))
-        self._password = _text(ext.get("password")) or self._account
-        self._accounts = _normalize_accounts(ext.get("accounts")) or _ACCOUNT_POOL
-        new_cfg = self._config_snapshot()
-        # 配置未变时复用既有会话与已预热缓存，避免重复登录和重新拉取首页
-        previous = getattr(self, "_cfg", None)
-        if new_cfg == previous and getattr(self, "_http", None) is not None:
-            self._cfg = new_cfg
-            return ""
-        self._cfg = new_cfg
-        self._http = self._new_http()
-        # init 同样不登录：登录在首个请求里按需完成，保证 init 立即返回
-        return ""
-
-    def getName(self) -> str:
-        return "懂片帝AI"
-
-    # -- 配置 / 分类 / 筛选 -------------------------------------------------- #
-
-    def _bootstrap(self) -> Dict[str, Any]:
-        def load():
-            obj, _ = self._http.request("GET", "/v1/runtime/bootstrap", signed=False)
-            return obj
-        return self._http.cached("runtime.bootstrap", 300.0, load)
-
-    def _bootstrap_view(self, allow_fetch: bool) -> Dict[str, Any]:
-        """取运行时配置：allow_fetch=True 走缓存/请求，False 时只读缓存不联网。"""
-        if allow_fetch:
-            return self._bootstrap()
-        return _as_dict(self._http.peek("runtime.bootstrap"))
-
-    def _categories_from(self, boot: Dict[str, Any]) -> List[Dict[str, str]]:
-        ui = _as_dict(_as_dict(boot).get("catalog_ui"))
-        out, seen = [], set()
-        for chan in _as_list(ui.get("channels")):
-            c = _as_dict(chan)
-            tid = _text(c.get("key"))
-            # 同一 type_id 只保留一个，避免出现两个同名/同 id 的分类标签
-            if not tid or tid in seen:
-                continue
-            seen.add(tid)
-            out.append({"type_id": tid,
-                        "type_name": _first(c.get("label"), tid)})
-        return out
-
-    def _build_categories(self) -> List[Dict[str, str]]:
-        return self._categories_from(self._bootstrap())
-
-    def _categories(self, allow_fetch: bool = True) -> List[Dict[str, str]]:
-        """分类标签。allow_fetch=False 时只读缓存，绝不触发网络。"""
-        raw = (self._http.cached("categories", 300.0, self._build_categories)
-               if allow_fetch else self._categories_from(self._bootstrap_view(False)))
-        result = []
-        seen = set()
-        for item in _as_list(raw):
-            obj = _as_dict(item)
-            tid = _text(obj.get("type_id"))
-            if not tid or tid in seen:
-                continue
-            seen.add(tid)
-            result.append({"type_id": tid,
-                           "type_name": _first(obj.get("type_name"), tid)})
-        # 缓存没热起来时也必须给出完整的分类，播放端才不会出现"分类空白"
-        return result or [dict(x) for x in _FALLBACK_CATEGORIES]
-
-    def _filters_from(self, boot: Dict[str, Any]) -> Dict[str, Any]:
-        ui = _as_dict(_as_dict(boot).get("catalog_ui"))
-        out = {}
-        for raw in _as_list(ui.get("catalogs")):
-            cat = _as_dict(raw)
-            kind = _text(cat.get("kind"))
-            if not kind:
-                continue
-            rows = []
-            for raw_row in _as_list(cat.get("rows")):
-                row = _as_dict(raw_row)
-                key = _text(row.get("key"))
-                if not key:
-                    continue
-                values = [{"n": "全部", "v": ""}]
-                for raw_opt in _as_list(row.get("options")):
-                    opt = _as_dict(raw_opt)
-                    if opt.get("enabled") is False:
-                        continue
-                    value = _encode_filter(_as_dict(opt.get("params")), key)
-                    if not value:
-                        continue
-                    label = _first(opt.get("label"), opt.get("key"), value)
-                    values.append({"n": label, "v": value})
-                if len(values) > 1:
-                    rows.append({"key": key,
-                                 "name": _ROW_LABELS.get(key) or _first(row.get("label"), key),
-                                 "value": values})
-            if rows:
-                out[kind] = rows
-        return out
-
-    def _build_filters(self) -> Dict[str, Any]:
-        return self._filters_from(self._bootstrap())
-
-    def _filters(self, allow_fetch: bool = True) -> Dict[str, Any]:
-        """筛选定义。allow_fetch=False 时只读缓存，绝不触发网络。"""
-        raw = (self._http.cached("filters", 300.0, self._build_filters)
-               if allow_fetch else self._filters_from(self._bootstrap_view(False)))
-        result = {}
-        if isinstance(raw, dict):
-            for kind, rows in raw.items():
-                cloned = _clone_filter_rows(rows)
-                if cloned:
-                    result[_text(kind)] = cloned
-        return result
-
-    @staticmethod
-    def _fill_filters(filters: Any, categories: List[Dict[str, str]]) -> Dict[str, Any]:
-        """保证 class 里每个 type_id 都有一份自己独立的筛选定义。
-        """
-        source = _as_dict(filters)
-        base = (source.get("movie") or source.get("series")
-                or source.get("updates") or next(iter(source.values()), []))
-        out = {}
-        for tid, rows in source.items():
-            tid = _text(tid)
-            if tid in _CALENDAR_TIDS:
-                continue
-            cloned = _clone_filter_rows(rows)
-            if tid and cloned:
-                out[tid] = cloned
-        for item in _as_list(categories):
-            tid = _text(_as_dict(item).get("type_id"))
-            if not tid or tid in out or tid in _CALENDAR_TIDS:
-                continue
-            cloned = _clone_filter_rows(base) or _clone_filter_rows(_FALLBACK_FILTERS)
-            if cloned:
-                out[tid] = cloned
-        for tid in _CALENDAR_TIDS:
-            out[tid] = _clone_filter_rows(_CALENDAR_FILTERS)
-        return out
-
-    # -- 卡片 -> TVBox VOD --------------------------------------------------- #
-
-    def _remember(self, vod_id: str, card: Dict[str, Any]) -> None:
-        with self._meta_lock:
-            if len(self._meta) > 800:
-                self._meta.clear()
-            self._meta[vod_id] = card
-
-    def _recall(self, vod_id: str) -> Dict[str, Any]:
-        with self._meta_lock:
-            return dict(self._meta.get(vod_id) or {})
-
-    def _vod_from_card(self, raw: Any) -> Optional[Dict[str, Any]]:
-        c = _as_dict(raw)
-        if not c:
-            return None
-        vod_id = _first(c.get("selected_variant_id"), c.get("default_variant_id"),
-                        c.get("id"), c.get("variant_id"))
-        if not vod_id:
-            detail_url = _text(c.get("detail_url"))
-            m = re.search(r"/v1/catalog/([^/?#]+)", detail_url)
-            if m:
-                vod_id = urllib.parse.unquote(m.group(1))
-        title = _first(c.get("title"), c.get("normalized_title"))
-        if not vod_id or not title:
-            return None
-        kind = _text(c.get("content_kind"))
-        genres = _names(c.get("genres"), 8)
-        availability = _as_dict(c.get("availability"))
-        self._remember(vod_id, c)
-        return {
-            "vod_id": vod_id,
-            "vod_name": title,
-            "vod_pic": _absolute(_first(c.get("poster_url"), c.get("carousel_url"),
-                                        c.get("backdrop_url")), self._host),
-            "vod_remarks": _first(c.get("remarks"), availability.get("label"),
-                                  c.get("episode_progress_text")),
-            "vod_year": _first(c.get("year")),
-            "vod_area": _first(c.get("area")),
-            "vod_lang": _first(c.get("language")),
-            "vod_actor": ",".join(_names(c.get("actors"), 20)),
-            "vod_director": ",".join(_names(c.get("directors"), 10)),
-            "vod_content": _first(c.get("overview"), c.get("description"),
-                                  c.get("summary")),
-            "type_name": _KIND_LABELS.get(kind, kind),
-            "vod_class": ",".join(genres),
-            "vod_time": _date_only(_first(c.get("updated_at"), c.get("recent_update"))),
-            "vod_tag": _first(availability.get("label"), c.get("update_status")),
-            "vod_score": "",
-        }
-
-    def _cards_to_vods(self, cards: List[Any]) -> List[Dict[str, Any]]:
-        out, seen = [], set()
-        for raw in _as_list(cards):
-            vod = self._vod_from_card(raw)
-            if vod and vod["vod_id"] not in seen:
-                seen.add(vod["vod_id"])
-                out.append(vod)
-        return out
-
-    # -- 首页 ---------------------------------------------------------------- #
-
-    def _home_feed(self) -> Dict[str, Any]:
-        def load():
-            obj, _ = self._http.request("GET", "/v1/feed/home", {
-                "scope": "public", "mode": "preview", "sections": 3, "cards": 10,
-            })
-            return obj
-        result = self._http.cached("home.feed", 300.0, load)
-        return result if isinstance(result, dict) else {}
-
-    def _home_vods(self, allow_fetch: bool = True) -> List[Dict[str, Any]]:
-        feed = (self._home_feed() if allow_fetch
-                else _as_dict(self._http.peek("home.feed")))
-        cards = []
-        for section in _as_list(feed.get("sections")):
-            cards.extend(_as_list(_as_dict(section).get("cards")))
-        return self._cards_to_vods(cards)
-
-    def homeContent(self, filter: Any = False) -> Dict[str, Any]:
-        # 参考实现的思路：分类与筛选是纯本地数据，绝不依赖网络是否成功。
-        # 这里先并行预热（有硬上限），随后只读缓存组装；登录/站点慢或不可达时
-        # 依然能立刻返回分类标签 + 筛选条件，播放端不会出现"分类空白"。
-        pool = ThreadPoolExecutor(max_workers=2)
-        try:
-            boot = pool.submit(self._bootstrap)
-            feed = pool.submit(self._home_feed)
+        if not chunks:
+            # 大小写不敏感地扫描全部响应头（有的 CDN 直接下发小写 set-cookie）
             try:
-                boot.result(timeout=self._home_deadline)
-                feed.result(timeout=self._home_deadline)
+                items = hdrs.items() if hasattr(hdrs, 'items') else []
+                for k, v in items:
+                    if str(k).strip().lower() == 'set-cookie' and v:
+                        chunks.append(str(v))
             except Exception:
                 pass
-        finally:
-            pool.shutdown(wait=False)
-        classes = self._categories(allow_fetch=False)
+        if not chunks:
+            try:
+                for key in ('Set-Cookie', 'set-cookie'):
+                    one = hdrs.get(key) if hasattr(hdrs, 'get') else None
+                    if isinstance(one, str) and one:
+                        chunks.append(one)
+                        break
+                    if one:
+                        chunks.extend([str(x) for x in one])
+                        break
+            except Exception:
+                pass
+        if not chunks:
+            return {}
+        text = ' | '.join(chunks)
+        jar = {}
+        for m in re.finditer(r'(ai_movie_[a-z0-9_]+)[=:]\s*([^;,\s|]*)', text, re.I):
+            name, value = m.group(1).strip(), m.group(2).strip()
+            if value:
+                jar[name] = value
+        return jar
+
+    def _merge_cookie(self, new_jar, base=None):
+        pairs = {}
+        for part in str(base if base is not None else self.headers.get('Cookie', '')).split(';'):
+            if '=' in part:
+                k, v = part.split('=', 1)
+                if k.strip():
+                    pairs[k.strip()] = v.strip()
+        for k, v in (new_jar or {}).items():
+            if v:
+                pairs[k] = v
+            else:
+                pairs.pop(k, None)
+        return '; '.join('{0}={1}'.format(k, v) for k, v in pairs.items())
+
+    def _login(self):
+        """用账号密码登录取会话，成功后只更新内存里的请求头（不落盘）。"""
+        if not self._account or not self._password:
+            return False
+        path = '/v1/users/password/login'
+        headers = self._sign_headers('POST', path)
+        # 用爬虫自己的设备号登录，避免顶掉浏览器上的会话
+        device = getattr(self, '_device_id', '') or DEFAULT_DEVICE_ID
+        base_cookie = 'ai_movie_browser=' + device
+        headers['Cookie'] = base_cookie
+        headers['Content-Type'] = 'application/json'
+        body = json.dumps({
+            'account': self._account,
+            'password': self._password,
+        }, ensure_ascii=False).encode('utf-8')
         try:
-            return {
-                "class": classes,
-                "filters": self._fill_filters(self._filters(allow_fetch=False), classes),
-                "list": self._home_vods(allow_fetch=False),
-            }
+            resp = self._fetch_post(self.site_url + path, headers, body)
         except Exception:
-            return {"class": classes,
-                    "filters": self._fill_filters({}, classes),
-                    "list": []}
+            return False
+        code = getattr(resp, 'status_code', 0)
+        if code and int(code) >= 400:
+            return False
+        jar = self._parse_set_cookie(resp)
+        if not jar:
+            return False
+        if 'ai_movie_browser' not in jar:
+            jar['ai_movie_browser'] = device
+        else:
+            # 服务端可能回发自己的设备号，记下来供下次登录复用
+            self._device_id = jar['ai_movie_browser']
+        cookie = self._merge_cookie(jar, base='')
+        if '=' not in cookie:
+            return False
+        self.headers['Cookie'] = cookie
+        gated = getattr(self, '_gated_tokens', None)
+        if gated:
+            gated.clear()
+        return True
 
-    def homeVideoContent(self) -> Dict[str, Any]:
+    def _sign_headers(self, method, path_with_search):
+        ts = str(int(time.time() * 1000))
+        nonce = os.urandom(16).hex()
+        msg = '{0}\n{1}\n{2}\n{3}'.format(method, path_with_search, ts, nonce)
+        sig = hmac.new(self.api_secret.encode('utf-8'), msg.encode('utf-8'), hashlib.sha256).hexdigest()
+        return {
+            **self.headers,
+            'x-ai-movie-timestamp': ts,
+            'x-ai-movie-nonce': nonce,
+            'x-ai-movie-signature': sig,
+        }
+
+    @staticmethod
+    def _to_json(resp):
+        if resp is None:
+            return {}
         try:
-            vods, _ = self._browse({
-                "page": 1, "limit": self._page_size, "sort": "updated_desc",
-            })
-            if not vods:
-                vods = self._home_vods()
-            return {"list": vods}
+            raw = getattr(resp, 'content', None)
+            if isinstance(raw, bytes) and raw:
+                try:
+                    return json.loads(raw.decode('utf-8', 'ignore'))
+                except Exception:
+                    return {}
         except Exception:
-            return {"list": []}
-
-    # -- 最近更新 ---------------------------------------------- #
-
-    @staticmethod
-    def _calendar_kind(extend: Any) -> str:
-        """解析类型筛选；兼容多种播放端传入的 key 与中文标签，缺省电视剧。"""
-        ext = _parse_extend(extend)
-        raw = ""
-        for key in ("cal_kind", "kind", "content_kind", "calendar_kind", "type"):
-            raw = _single_value(ext.get(key))
-            if raw:
-                break
-        if raw in _CALENDAR_KIND_IDS:
-            return raw
-        for kind, label in _CALENDAR_KINDS:
-            if raw == label:
-                return kind
-        return _CALENDAR_DEFAULT_KIND
-
-    def _calendar_day(self) -> Tuple[str, int]:
-        """今天（Asia/Shanghai）与站点 weekday（周一=1 ... 周日=7）。"""
-        t = time.gmtime(self._http.now() + 8 * 3600)
-        return ("%04d-%02d-%02d" % (t.tm_year, t.tm_mon, t.tm_mday), t.tm_wday + 1)
-
-    @staticmethod
-    def _calendar_weekday(obj: Dict[str, Any], today: str) -> int:
-        """从 days 中找今天对应的 weekday；days 只有一天时用于校验日期。"""
-        for raw in _as_list(_as_dict(obj).get("days")):
-            day = _as_dict(raw)
-            if _text(day.get("date")) == today:
-                return _int(day.get("weekday"), 0)
-        return 0
-
-    @staticmethod
-    def _calendar_group(obj: Dict[str, Any], kind: str,
-                        today: str) -> Dict[str, Any]:
-        """取今天、指定类型那一组；请求带 weekday 时 days 通常只有一天。"""
-        days = [_as_dict(x) for x in _as_list(_as_dict(obj).get("days"))]
-        for day in days:
-            if len(days) > 1 and _text(day.get("date")) != today:
-                continue
-            group = _as_dict(_as_dict(day.get("groups")).get(kind))
-            if group:
-                return group
-        # 日期与快照错位时退化为第一组，至少保证有内容可展示
-        for day in days:
-            group = _as_dict(_as_dict(day.get("groups")).get(kind))
-            if group:
-                return group
+            pass
+        try:
+            text = getattr(resp, 'text', None)
+            if text:
+                try:
+                    return json.loads(text)
+                except Exception:
+                    return {}
+        except Exception:
+            pass
         return {}
 
-    @staticmethod
-    def _calendar_card(card: Dict[str, Any], kind: str) -> Dict[str, Any]:
-        """最近更新卡片 -> 通用卡片字段，复用 _vod_from_card 的映射。"""
-        c = dict(card)
-        forecast = _as_dict(c.get("forecast"))
-        c["remarks"] = _first(c.get("latest_episode_label"),
-                              c.get("season_label"), forecast.get("label"))
-        c["update_status"] = _first(forecast.get("label"))
-        c["recent_update"] = _first(c.get("available_at"),
-                                    forecast.get("target_date"))
-        if not c.get("content_kind"):
-            c["content_kind"] = kind
-        return c
+    def _fetch_post(self, url, headers, body):
+        # 不同 TVBox 内核的 fetch 对 POST 支持不一致，逐级降级
+        err = None
+        for kwargs in ({'data': body, 'method': 'POST'},
+                       {'data': body},
+                       {'body': body, 'method': 'POST'}):
+            try:
+                return self.fetch(url, headers=headers, timeout=15000, **kwargs)
+            except TypeError as e:
+                err = e
+                continue
+        post = getattr(self, 'post', None)
+        try:
+            if callable(post):
+                return post(url, headers=headers, data=body, timeout=15000)
+        except TypeError:
+            return post(url, headers=headers, data=body)
+        if err:
+            raise err
+        raise RuntimeError('unsupported post')
 
-    def _calendar_state(self, kind: str, today: str,
-                        weekday: int) -> Dict[str, Any]:
-        """取「日期+类型」的逐页状态；超过 TTL 或 weekday 变化时重建。"""
-        key = (self._host, today, kind)
-        now = time.time()
-        with self._calendar_lock:
-            for old in [k for k, v in self._calendar_states.items()
-                        if now - v.get("ts", 0.0) > _CALENDAR_TTL]:
-                self._calendar_states.pop(old, None)
-            state = self._calendar_states.get(key)
-            if not state or state.get("weekday") != weekday:
-                state = {
-                    "pages": {},          # page -> 该页 VOD（请求过即缓存）
-                    "cursors": {1: ""},  # page -> 请求该页所需 cursor，"" 为首页
-                    "seen": set(),        # 跨页 vod_id 去重
-                    "total": 0,           # 服务端给出的当天总数
-                    "exhausted": False,   # 已无下一页
-                    "weekday": weekday,
-                    "ts": now,
-                }
-                self._calendar_states[key] = state
-        return state
+    def _request(self, method, path, payload=None):
+        url = self.site_url + path
+        headers = self._sign_headers(method, path)
+        body = None
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            headers['Content-Type'] = 'application/json'
+        # GET 遇到空响应（限流/抖动）退避重试；POST 不重试，避免重复扣费
+        attempts = 3 if method == 'GET' else 1
+        for i in range(attempts):
+            try:
+                if method == 'GET':
+                    resp = self.fetch(url, headers=headers, timeout=15000)
+                else:
+                    resp = self._fetch_post(url, headers, body)
+                data = self._to_json(resp)
+            except Exception:
+                data = {}
+            if data:
+                return data
+            if i + 1 < attempts:
+                time.sleep(0.3 if i == 0 else 1.0)
+        return {}
 
-    def _calendar_fetch_page(self, state: Dict[str, Any], page: int,
-                             limit: int, kind: str, today: str) -> bool:
-        """一个 TVBox 页 = 一次接口请求，limit 与每页条数一致，推进 cursor。"""
-        cursor = state["cursors"].get(page)
-        if cursor is None:
-            return False
-        weekday = _int(state.get("weekday"), 1)
-        params = {"week": "current", "kind": kind, "sort": "heat",
-                  "weekday": weekday, "view": "weekly", "limit": limit}
-        if cursor:
-            params["cursor"] = cursor
-        obj, _ = self._http.request("GET", _CALENDAR_PATH, params)
-        # 仅首页校正 weekday：本地时钟与站点周快照跨周/错位时重建映射
-        if (page == 1 and not cursor and _as_list(_as_dict(obj).get("days"))
-                and not self._calendar_weekday(obj, today)):
-            probe, _ = self._http.request("GET", _CALENDAR_PATH, {
-                "week": "current", "kind": kind, "sort": "heat",
-                "view": "weekly", "limit": 4,
-            })
-            fixed = self._calendar_weekday(probe, today)
-            if fixed and fixed != weekday:
-                params["weekday"] = fixed
-                state["weekday"] = fixed
-                obj, _ = self._http.request("GET", _CALENDAR_PATH, params)
-        if not obj:
-            state["exhausted"] = True
-            return False
-        detail = _as_dict(_as_dict(obj).get("detail"))
-        group = self._calendar_group(obj, kind, today)
-        cards = [self._calendar_card(_as_dict(raw), kind)
-                 for raw in _as_list(group.get("preview"))]
-        vods = []
-        for vod in self._cards_to_vods(cards):
-            vid = _text(vod.get("vod_id"))
-            if vid and vid not in state["seen"]:
-                state["seen"].add(vid)
-                vods.append(vod)
-        state["pages"][page] = vods
-        total = _int(detail.get("total"), 0)
-        if total > 0:
-            state["total"] = total
-        next_cursor = _text(detail.get("next_cursor"))
-        if next_cursor and detail.get("has_more"):
-            state["cursors"][page + 1] = next_cursor
-        else:
-            state["exhausted"] = True
-        return True
+    def _api_get(self, path):
+        return self._request('GET', path)
 
-    def _calendar_content(self, extend: Any, page: int,
-                          limit: int) -> Dict[str, Any]:
-        """最近更新分页：今天 + 选定类型，一页对应一次接口请求，无本地切片。"""
-        kind = self._calendar_kind(extend)
-        today, weekday = self._calendar_day()
-        with self._calendar_lock:
-            state = self._calendar_state(kind, today, weekday)
-            # 跳页时按顺序补齐 cursor 链（顺带缓存中间页）；逐页滑动时目标页
-            # 的 cursor 已由上一页给出，直接 1 次请求返回该页 20 条
-            hops = 0
-            while (page not in state["cursors"] and not state["exhausted"]
-                   and hops < _CALENDAR_MAX_CHAIN_FETCHES):
-                prev_page = max(state["cursors"])
-                if (prev_page in state["pages"]
-                        and (prev_page + 1) not in state["cursors"]):
-                    break
-                if not self._calendar_fetch_page(state, prev_page, limit,
-                                                 kind, today):
-                    break
-                hops += 1
-            if page in state["cursors"] and page not in state["pages"]:
-                self._calendar_fetch_page(state, page, limit, kind, today)
-            page_vods = list(state["pages"].get(page) or [])
-            total = max(_int(state.get("total"), 0), len(page_vods))
-        if not page_vods and not total:
-            return _empty_page(page, limit)
+    def _api_post(self, path, payload):
+        return self._request('POST', path, payload)
+
+    def _parse_card(self, card):
+        vid = card.get('id', '') or ''
+        name = card.get('title', '') or ''
+        pic = card.get('poster_url', '') or ''
+        remark = card.get('remarks', '') or ''
+        year = str(card.get('year', '')) if card.get('year') else ''
+        area = card.get('area', '') or ''
+        genres = card.get('genres', [])
+        type_name = ' / '.join(genres[:3]) if genres else ''
         return {
-            "list": page_vods,
-            "page": page,
-            "pagecount": int(math.ceil(total / float(limit))) if total > 0 else 0,
-            "limit": limit,
-            "total": total,
+            'vod_id': vid,
+            'vod_name': name,
+            'vod_pic': pic if pic else self.default_pic,
+            'vod_remarks': remark,
+            'vod_year': year,
+            'vod_area': area,
+            'vod_type': type_name,
         }
 
-    # -- 列表 / 分类 / 搜索 -------------------------------------------------- #
+    def _calc_pagecount(self, pag, page, limit):
+        total = pag.get('total', 0)
+        if total and limit:
+            return (total + limit - 1) // limit
+        if pag.get('has_more'):
+            return page + 1
+        return page
 
-    def _browse(self, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        obj, _ = self._http.request("GET", "/v1/browse/catalog", params)
-        # 异常响应（410 候选集失效 / 数据源失败）时退化为不带附加标记的纯查询
-        if not _as_list(obj.get("cards")) and _text(obj.get("status")) == "410":
-            retry = dict(params)
-            for key in ("candidate_set_ref", "continue_search"):
-                retry.pop(key, None)
-            obj, _ = self._http.request("GET", "/v1/browse/catalog", retry)
-        return self._cards_to_vods(obj.get("cards")), _as_dict(obj.get("pagination"))
-
-    def _page_result(self, vods: List[Dict[str, Any]],
-                     pagination: Dict[str, Any], page: int,
-                     limit: int) -> Dict[str, Any]:
-        if not vods:
-            return _empty_page(page, limit)
-        p = _as_dict(pagination)
-        has_more = bool(p.get("has_more"))
-        returned = _int(p.get("returned_count"), len(vods))
-        total = _int(p.get("total"), -1)
-        if total < 0:
-            offset = _int(p.get("offset"), (page - 1) * limit)
-            total = max(0, offset + returned + (limit if has_more else 0))
-        pagecount = int(math.ceil(total / float(limit))) if total > 0 else 0
-        if has_more and pagecount <= page:
-            pagecount = page + 1
-        return {"list": vods, "page": page, "pagecount": pagecount,
-                "limit": limit, "total": total}
+    def _is_valid_video_url(self, url):
+        if not url or not isinstance(url, str):
+            return False
+        url = url.strip()
+        if not url.lower().startswith('http'):
+            return False
+        # 去掉 query 再看扩展名，避免被 CDN 签名参数干扰
+        path = url.lower().split('?')[0].split('#')[0]
+        for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.svg', '.ico']:
+            if ext in path:
+                return False
+        for bad in ['/image.', 'image.image', '~tplv-']:
+            if bad in path:
+                return False
+        return True
 
     @staticmethod
-    def _extend_params(extend: Any) -> Dict[str, Any]:
-        out = {}
-        for key, raw in _parse_extend(extend).items():
-            k = _text(key)
-            if k not in _FILTER_KEYS:
-                continue
-            value = _single_value(raw)
-            if not value:
-                continue
-            if "=" in value:
-                try:
-                    pairs = urllib.parse.parse_qsl(value, keep_blank_values=False)
-                    if pairs and all(_text(a) in _FILTER_KEYS for a, _ in pairs):
-                        for a, b in pairs:
-                            if _text(b):
-                                out[_text(a)] = _text(b)
-                        continue
-                except Exception:
-                    pass
-            out[k] = value
-        return out
+    def _ticket_of(opt):
+        """取出 resolve_ticket 线路里的票据；非该类型返回空串。"""
+        if (opt.get('url_kind') or '') != 'resolve_ticket':
+            return ''
+        url = (opt.get('url') or '').strip()
+        if url.startswith('resolve://'):
+            return url[10:].strip()
+        if url and not url.startswith('http'):
+            return url
+        return ''
 
-    def categoryContent(self, tid: Any, pg: Any = 1,
-                        filter: Any = False, extend: Any = None) -> Dict[str, Any]:
-        page = _positive(pg, 1, _MAX_PAGES)
-        limit = self._page_size
-        try:
-            type_id = _text(tid)
-    
-            if type_id in _CALENDAR_TIDS:
-                return self._calendar_content(extend, page, limit)
-            params = {"page": page, "limit": limit}
-            if type_id == "recommend":
-                params["sort"] = "trending"
-                params["window"] = "day"
-            elif type_id in _KIND_IDS:
-                params["kind"] = type_id
-                params["sort"] = "heat_desc"
-            elif type_id:
-                # 未知 tid：当作搜索词兜底，避免返回难以理解的错误
-                params["q"] = type_id
-            params.update(self._extend_params(extend))
-            vods, pagination = self._browse(params)
-            return self._page_result(vods, pagination, page, limit)
-        except Exception:
-            return _empty_page(page, limit)
-
-    def searchContent(self, key: Any, quick: Any = False,
-                      pg: Any = 1) -> Dict[str, Any]:
-        page = _positive(pg, 1, _MAX_PAGES)
-        word = _text(key)
-        limit = 10 if quick else self._page_size
-        if not word:
-            return _empty_page(page, limit)
-        try:
-            vods, pagination = self._browse({
-                "q": word, "page": page, "limit": limit, "intent": "catalog_search",
-            })
-            return self._page_result(vods, pagination, page, limit)
-        except Exception:
-            return _empty_page(page, limit)
-
-    # -- 详情 / 剧集 --------------------------------------------------------- #
-
-    def _fetch_episodes(self, vod_id: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        base = "/v1/catalog/" + _quote(vod_id)
-        detail, _ = self._http.request("GET", base, {
-            "episodes": "window", "episode_limit": 100,
-        })
-        if not detail:
-            return {}, []
-        episodes = [e for e in _as_list(detail.get("episodes")) if isinstance(e, dict)]
-        pagination = _as_dict(detail.get("episode_pagination"))
-        total = _int(pagination.get("total_count"), len(episodes))
-        step = _positive(pagination.get("limit"), len(episodes) or 48, 100)
-        offset = (_int(pagination.get("offset"), 0)
-                  + _int(pagination.get("returned_count"), len(episodes)))
-        guard = 0
-        while (pagination.get("has_more") and offset < total
-               and guard < _MAX_EPISODE_PAGES):
-            guard += 1
-            part, _ = self._http.request("GET", base + "/episodes", {
-                "offset": offset, "limit": step,
-            })
-            chunk = [e for e in _as_list(part.get("episodes")) if isinstance(e, dict)]
-            if not chunk:
-                break
-            episodes.extend(chunk)
-            page2 = _as_dict(part.get("episode_pagination"))
-            returned = _int(page2.get("returned_count"), len(chunk))
-            if returned <= 0:
-                break
-            new_total = _int(page2.get("total_count"), total)
-            if new_total > 0:
-                total = new_total
-            offset += returned
-            pagination = page2
-        # 去重：优先按 token，其次按剧集 id / 序号
-        unique, seen = [], set()
-        for ep in episodes:
-            token = _text(ep.get("token"))
-            number = _text(ep.get("number"))
-            marker = token or _text(ep.get("id")) or ("n:" + number)
-            if not marker or marker in seen:
-                continue
-            seen.add(marker)
-            unique.append(ep)
-        return detail, unique
-
-    @staticmethod
-    def _episode_parts(episode: Dict[str, Any]) -> Tuple[str, str]:
-        number = _text(episode.get("number"))
-        name = _piece(_first(episode.get("title"), episode.get("display_name"),
-                             ("第" + number + "集") if number else "正片"))
-        token = _piece(_first(episode.get("token"), episode.get("episode_token")))
-        if token:
-            return name or "正片", token
-        urls = _as_dict(episode.get("urls"))
-        for key in ("m3u8", "url", "play_url", "hls", "mp4"):
-            candidate = _text(urls.get(key))
-            if _is_http(candidate):
-                return name or "正片", candidate
-        for value in urls.values():
-            if _is_http(value):
-                return name or "正片", _text(value)
-        return "", ""
-
-    @staticmethod
-    def _normalize_line(raw: Any) -> Dict[str, Any]:
-        """兼容 compact 视图（id/label）与完整视图（playback_source_id/display_label）。"""
-        line = dict(_as_dict(raw))
-        line["playback_source_id"] = _first(
-            line.get("playback_source_id"), line.get("id")
-        )
-        line["display_label"] = _first(line.get("display_label"), line.get("label"))
-        line["provider_name"] = _first(line.get("provider_name"), line.get("label"))
-        url = _text(line.get("url"))
-        ticket = _text(line.get("resolve_ticket"))
-        if not ticket and url.startswith("resolve://"):
-            ticket = url[len("resolve://"):].strip()
-        if not ticket and _text(line.get("url_kind")) == "resolve_ticket":
-            ticket = url
-        line["_ticket"] = ticket
-        return line
-
-    @staticmethod
-    def _is_ticket_line(line: Dict[str, Any]) -> bool:
-        """优先识别 url_kind == resolve_ticket 的视频源。"""
-        if _text(line.get("url_kind")) == "resolve_ticket":
-            return True
-        url = _text(line.get("url"))
-        return (_text(line.get("resolve_mode")) == "parse"
-                and (url.startswith("resolve://") or bool(_text(line.get("_ticket")))))
-
-    @staticmethod
-    def _select_lines(lines: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:
-        """有票据源时只保留票据源；否则展示其他视频源。"""
-        tickets = [
-            line for line in lines
-            if Spider._is_ticket_line(line) and _text(line.get("_ticket"))
-        ]
-        if tickets:
-            return tickets, True
-        return lines, False
-
-    def _lines(self, token: str, refresh: bool = False) -> List[Dict[str, Any]]:
-        if not token or not token.startswith("av_"):
-            return []
-        key = "lines:" + token
-
-        def load():
-            obj, _ = self._http.request(
-                "GET", "/v1/playback/resolve/" + _quote(token) + "?view=compact"
-            )
-            return obj
-
-        if refresh:
-            self._http.invalidate(key)
-        obj = self._http.cached(key, 45.0, load)
-        return [self._normalize_line(line)
-                for line in _as_list(obj.get("line_options"))
-                if isinstance(line, dict)]
-
-    def _resolve_ticket_line(self, line: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """对 resolve_ticket 源做二次播放处理，换取真实可播地址。"""
-        ticket = _text(line.get("_ticket"))
+    def _resolve_ticket(self, ticket):
+        """ticket -> (真实播放地址, 是否需要登录)。
+        必须带 view=compact（该 query 参与签名），body 只传 ticket。"""
         if not ticket:
+            return '', False
+        path = '/v1/playback/resolve-line?view=compact'
+        headers = self._sign_headers('POST', path)
+        headers['Content-Type'] = 'application/json'
+        body = json.dumps({'ticket': ticket}, ensure_ascii=False).encode('utf-8')
+        try:
+            resp = self._fetch_post(self.site_url + path, headers, body)
+        except Exception:
+            return '', False
+        data = self._to_json(resp)
+        code = getattr(resp, 'status_code', 0)
+        biz = ''
+        if isinstance(data, dict):
+            biz = str(data.get('code') or '')
+        if code == 401 or biz.startswith('playback_user_session') or biz == 'login_required':
+            return '', True
+        line = (data or {}).get('line') if isinstance(data, dict) else None
+        if not line and isinstance(data, dict) and data.get('url'):
+            line = data
+        if not isinstance(line, dict):
+            return '', False
+        real = (line.get('url') or '').strip()
+        if real and self._is_valid_video_url(real):
+            return real, False
+        return '', False
+
+    def _probe_direct(self, url):
+        """轻量探活：True=可用，False=明确失败，None=无法判断（按可用处理）。
+        只用于 m3u8 清单，避免把整部 mp4 拉下来。"""
+        if '.m3u8' not in (url or '').lower():
             return None
-        cache_key = "ticket:" + hashlib.sha1(ticket.encode("utf-8")).hexdigest()
+        try:
+            resp = self.fetch(url, headers={
+                'User-Agent': self.headers['User-Agent'],
+                'Referer': self.site_url + '/',
+            }, timeout=6000)
+        except Exception:
+            return None
+        code = getattr(resp, 'status_code', None)
+        if code is None:
+            return None
+        try:
+            code = int(code)
+        except Exception:
+            return None
+        return 200 <= code < 400
 
-        def load():
-            obj, status = self._http.request(
-                "POST", _RESOLVE_LINE_PATH, body={"ticket": ticket}
-            )
-            if status not in (200, 201):
-                return {}
-            resolved = self._normalize_line(obj.get("line"))
-            url = _text(resolved.get("url"))
-            if not _is_http(url) or resolved.get("resolved") is False:
-                return {}
-            resolved["url"] = url
-            return resolved
-
-        result = self._http.cached(cache_key, 90.0, load)
-        if isinstance(result, dict) and _is_http(result.get("url")):
-            return result
-        return None
-
-    @staticmethod
-    def _line_label(line: Dict[str, Any]) -> str:
-        return _piece(_first(line.get("display_label"), line.get("label"),
-                             line.get("provider_name"), line.get("play_from"),
-                             line.get("provider_id"), line.get("id"), "线路"))
-
-    def _flags(self, lines: List[Dict[str, Any]],
-               ticket_mode: bool = False) -> List[str]:
-        flags, seen = [], set()
-        for line in lines:
-            if ticket_mode:
-                if not self._is_ticket_line(line):
+    def homeContent(self, filter):
+        categories = [{'type_id': k, 'type_name': v} for k, v in self.categories.items()]
+        data = self._api_get('/v1/feed/home')
+        videos = []
+        seen = set()
+        for sec in data.get('sections', []):
+            for card in sec.get('cards', []):
+                vid = card.get('id', '')
+                if not vid or vid in seen:
                     continue
-            elif not _is_direct_line(line):
-                continue
-            label = self._line_label(line)
-            if not label or label in seen:
-                continue
-            seen.add(label)
-            flags.append(label)
-            if len(flags) >= _MAX_LINES:
-                break
-        return flags or ["懂片帝"]
+                seen.add(vid)
+                videos.append(self._parse_card(card))
+        filters = {}
+        for k, v in self.categories.items():
+            if k in self.filters:
+                filters[k] = self.filters[k]
+        return {'class': categories, 'list': videos[:30], 'filters': filters}
 
-    def detailContent(self, ids: Any) -> Dict[str, Any]:
-        try:
-            raw_ids = ids if isinstance(ids, (list, tuple)) else [ids]
-            vod_id = ""
-            for item in raw_ids:
-                vod_id = _text(item)
-                if vod_id:
-                    break
-            if not vod_id:
-                return _empty_detail()
-            detail, episodes = self._fetch_episodes(vod_id)
-            card = self._recall(vod_id)
-            if not detail and not card:
-                return _empty_detail()
+    def homeVideoContent(self):
+        data = self._api_get('/v1/feed/home')
+        videos = []
+        seen = set()
+        for sec in data.get('sections', []):
+            for card in sec.get('cards', []):
+                vid = card.get('id', '')
+                if not vid or vid in seen:
+                    continue
+                seen.add(vid)
+                videos.append(self._parse_card(card))
+        return {'list': videos[:30]}
 
-            merged = dict(card)
-            merged.update(detail or {})
+    def categoryContent(self, tid, pg, filter, extend):
+        page = int(pg) if pg else 1
+        limit = 30
+        params = ['kind={0}'.format(tid), 'page={0}'.format(page), 'limit={0}'.format(limit)]
+        if extend:
+            if extend.get('genre'):
+                params.append('genre={0}'.format(urllib.parse.quote(extend['genre'])))
+            if extend.get('region'):
+                params.append('region={0}'.format(urllib.parse.quote(extend['region'])))
+            if extend.get('year'):
+                y = extend['year']
+                if '_' in y:
+                    parts = y.split('_')
+                    params.append('year_from={0}&year_to={1}'.format(parts[0], parts[1]))
+                else:
+                    params.append('year={0}'.format(y))
+            if extend.get('sort'):
+                params.append('sort={0}'.format(extend['sort']))
+            if extend.get('status'):
+                params.append('status={0}'.format(extend['status']))
+        path = '/v1/browse/catalog?' + '&'.join(params)
+        data = self._api_get(path)
+        cards = data.get('cards', []) or []
+        videos = [self._parse_card(c) for c in cards if c.get('id')]
+        pag = data.get('pagination', {}) or {}
+        total = pag.get('total', 0) or len(videos)
+        pagecount = self._calc_pagecount(pag, page, limit)
+        return {
+            'list': videos,
+            'page': page,
+            'pagecount': pagecount,
+            'limit': limit,
+            'total': total,
+        }
 
-            entries = []
+    def searchContent(self, key, quick, pg='1'):
+        page = int(pg) if pg else 1
+        limit = 30
+        encoded = urllib.parse.quote(key)
+        path = '/v1/browse/catalog?q={0}&page={1}&limit={2}'.format(encoded, page, limit)
+        data = self._api_get(path)
+        cards = data.get('cards', []) or []
+        videos = [self._parse_card(c) for c in cards if c.get('id')]
+        pag = data.get('pagination', {}) or {}
+        total = pag.get('total', 0) or len(videos)
+        pagecount = self._calc_pagecount(pag, page, limit)
+        return {
+            'list': videos,
+            'page': page,
+            'pagecount': pagecount,
+            'limit': limit,
+            'total': total,
+        }
+
+    def detailContent(self, ids):
+        if not ids:
+            return {'list': []}
+        vid = ids[0]
+        data = self._api_get('/v1/catalog/{0}'.format(vid))
+        if not data or 'id' not in data:
+            # 详情拉取失败（限流/下架）时返回占位条目，避免列表项被整体丢弃
+            return {'list': [{
+                'vod_id': vid,
+                'vod_name': vid,
+                'vod_pic': self.default_pic,
+                'vod_content': '详情获取失败，请稍后重试。',
+                'vod_play_from': '默认线路',
+                'vod_play_url': '播放${0}/player/{1}'.format(self.site_url, vid),
+            }]}
+        title = data.get('title', '') or ''
+        pic = data.get('poster_url', '') or self.default_pic
+        content = data.get('description', '') or ''
+        actors = data.get('actors', [])
+        actor = ' / '.join(actors[:20]) if actors else ''
+        directors = data.get('directors', [])
+        director = ' / '.join(directors[:10]) if directors else ''
+        year = str(data.get('year', '')) if data.get('year') else ''
+        area = data.get('area', '') or ''
+        genres = data.get('genres', [])
+        type_name = ' / '.join(genres[:5]) if genres else ''
+        play_from = []
+        play_url = []
+
+        def extract_episodes(episodes, provider_id=''):
+            ep_list = []
+            # id 结构：token@@provider_id@@vod_id，便于 playerContent 在失败时回落到影片页
+            suffix = '@@{0}@@{1}'.format(provider_id or '', vid)
             for ep in episodes:
-                name, play_id = self._episode_parts(ep)
-                if name and play_id:
-                    entries.append((name, play_id))
-            if not entries:
-                # 电影/单集：允许用 vod_id 自身触发播放解析
-                entries = [("正片", vod_id)]
+                ep_title = ep.get('title', '') or ''
+                if not ep_title:
+                    num = ep.get('number')
+                    if num is not None:
+                        ep_title = '第{0}集'.format(num)
+                    else:
+                        ep_title = '播放'
+                token = ep.get('token', '')
+                if not token:
+                    continue
+                ep_list.append('{0}${1}{2}'.format(ep_title, token, suffix))
+            return ep_list
 
-            first_token = ""
-            for _, play_id in entries:
-                if play_id.startswith("av_"):
-                    first_token = play_id
+        episodes = data.get('episodes', [])
+        if not episodes:
+            ep_data = self._api_get('/v1/catalog/{0}/episodes'.format(vid))
+            episodes = ep_data.get('episodes', [])
+
+        if episodes:
+            first_token = ''
+            for ep in episodes:
+                if ep.get('token'):
+                    first_token = ep.get('token')
                     break
-            lines = self._lines(first_token) if first_token else []
-            selected, ticket_mode = self._select_lines(lines)
-            flags = self._flags(selected, ticket_mode)
-            play_lists = []
-            for _ in flags:
-                play_lists.append("#".join(
-                    "%s$%s" % (name, play_id) for name, play_id in entries
-                ))
 
-            progress = _first(merged.get("episode_progress_text"), merged.get("remarks"))
-            update_status = _text(merged.get("update_status"))
-            genres = _names(merged.get("genres"), 8)
-            kind = _text(merged.get("content_kind"))
-            availability = _as_dict(merged.get("availability"))
-            seasons = _as_list(merged.get("seasons")) or _as_list(merged.get("variants"))
-            description = _first(merged.get("description"), merged.get("overview"),
-                                 merged.get("summary"), merged.get("vod_content"))
-            if seasons and description:
-                extra = "共%s季 / %s集" % (len(seasons), len(entries))
-                if extra not in description:
-                    description = description + "\n" + extra
+            valid_lines = []
+            if first_token:
+                resolve_data = self._api_get('/v1/playback/resolve/{0}'.format(first_token))
+                line_options = resolve_data.get('line_options', []) or []
+                # 只保留 resolve_ticket 线路，按接口返回顺序，不去重、不截断
+                valid_lines = [opt for opt in line_options if self._ticket_of(opt)]
+                if not valid_lines and DIRECT_FALLBACK_WHEN_NO_TICKET:
+                    # 长尾片源只有第三方直链，没有官方线路；此时退回直链，否则整条记录无法播放
+                    valid_lines = [
+                        opt for opt in line_options
+                        if (opt.get('url') or '').startswith('http')
+                        and self._is_valid_video_url(opt.get('url'))
+                    ]
 
-            vod = {
-                "vod_id": vod_id,
-                "vod_name": _first(merged.get("title"), merged.get("normalized_title"),
-                                   merged.get("vod_name")),
-                "vod_pic": _absolute(_first(merged.get("poster_url"),
-                                            merged.get("carousel_url"),
-                                            merged.get("backdrop_url")), self._host),
-                "vod_remarks": _first(progress, merged.get("vod_remarks"),
-                                      availability.get("label")),
-                "vod_year": _first(merged.get("year"), merged.get("vod_year")),
-                "vod_area": _first(merged.get("area"), merged.get("vod_area")),
-                "vod_lang": _first(merged.get("language"), merged.get("vod_lang")),
-                "vod_actor": ",".join(_names(merged.get("actors"), 20)),
-                "vod_director": ",".join(_names(merged.get("directors"), 10)),
-                "vod_content": description,
-                "type_name": _KIND_LABELS.get(kind, kind or _text(merged.get("type_name"))),
-                "vod_class": ",".join(genres),
-                "vod_time": _date_only(_first(merged.get("updated_at"),
-                                              merged.get("vod_time"),
-                                              merged.get("generated_at"))),
-                "vod_tag": _first(availability.get("label"), update_status,
-                                  merged.get("vod_tag")),
-                "vod_score": "",
-                "vod_play_from": "$$$".join(flags),
-                "vod_play_url": "$$$".join(play_lists),
-            }
-            return {"list": [vod]}
-        except Exception:
-            return _empty_detail()
+            if valid_lines:
+                used_names = set()
+                for line in valid_lines:
+                    provider_name = line.get('provider_name') or line.get('label') or '默认线路'
+                    provider_id = line.get('provider_id') or ''
+                    ep_list = extract_episodes(episodes, provider_id)
+                    if not ep_list:
+                        continue
+                    # play_from 与 play_url 必须一一对应，否则解析器会错位取不到线路
+                    name = provider_name
+                    idx = 2
+                    while name in used_names:
+                        name = '{0}({1})'.format(provider_name, idx)
+                        idx += 1
+                    used_names.add(name)
+                    play_from.append(name)
+                    play_url.append('#'.join(ep_list))
 
-    # -- 播放地址 ------------------------------------------------------------- #
+            if not play_from:
+                ep_list = extract_episodes(episodes)
+                if ep_list:
+                    play_from.append('默认线路')
+                    play_url.append('#'.join(ep_list))
+        else:
+            play_from.append('默认线路')
+            play_url.append('播放${0}/player/{1}'.format(self.site_url, vid))
 
-    @staticmethod
-    def _clean_id(value: Any) -> str:
-        s = _text(value)
-        if not s:
-            return ""
-        # 兼容 TVBox 偶尔回传 "集名$id" 或 "a#b" 的形态
-        if "$" in s:
-            s = s.split("$")[-1]
-        if "#" in s:
-            s = s.split("#")[0]
-        s = s.strip()
-        if "%" in s:
-            try:
-                decoded = urllib.parse.unquote(s)
-                if decoded:
-                    s = decoded
-            except Exception:
-                pass
-        return s
+        result = [{
+            'vod_id': vid,
+            'vod_name': title,
+            'vod_pic': pic,
+            'vod_content': content,
+            'vod_actor': actor,
+            'vod_director': director,
+            'vod_year': year,
+            'vod_area': area,
+            'vod_type': type_name,
+            'vod_play_from': '$$$'.join(play_from),
+            'vod_play_url': '$$$'.join(play_url),
+        }]
+        return {'list': result}
 
-    def _pick_line_by_flag(self, lines: List[Dict[str, Any]],
-                           flag: str) -> Optional[Dict[str, Any]]:
-        """按用户选中的线路名匹配；匹配不到时退回优先级最高的线路。"""
-        if not lines:
-            return None
+    def playerContent(self, flag, id, vipFlags):
+        play_header = {
+            'User-Agent': self.headers['User-Agent'],
+            'Referer': self.site_url + '/',
+        }
 
-        def score(line: Dict[str, Any]) -> Tuple[int, int, int]:
-            labels = {
-                _text(line.get("display_label")), _text(line.get("label")),
-                _text(line.get("provider_name")), _text(line.get("play_from")),
-                _text(line.get("provider_id")), _text(line.get("id")),
-                self._line_label(line),
-            }
-            match = 2 if flag and flag in labels else (1 if not flag else 0)
-            selected = 1 if line.get("selected") is True else 0
-            weight = _int(line.get("preference_weight"), 0)
-            return match, selected, weight
+        raw_id = id or ''
+        if '$' in raw_id:
+            raw_id = raw_id.split('$')[-1]
+        parts = raw_id.strip().split('@@')
+        token = parts[0].strip()
+        selected_provider = parts[1].strip() if len(parts) > 1 else ''
+        vod_id = parts[2].strip() if len(parts) > 2 else ''
 
-        matched = [line for line in lines if score(line)[0] > 0] if flag else []
-        pool = matched or lines
-        pool = sorted(pool, key=lambda line: (
-            -score(line)[0], -score(line)[1], -score(line)[2]
-        ))
-        return pool[0] if pool else None
+        def page_url():
+            return '{0}/player/{1}'.format(self.site_url, vod_id or token)
 
-    def _pick_line(self, lines: List[Dict[str, Any]],
-                   flag: str) -> Optional[Dict[str, Any]]:
-        direct = [line for line in lines if _is_direct_line(line)]
-        return self._pick_line_by_flag(direct, flag) if direct else None
+        if not token:
+            return {'parse': 1, 'url': id, 'header': play_header}
 
-    @staticmethod
-    def _line_headers(line: Dict[str, Any], host: str) -> Dict[str, str]:
-        headers = {"User-Agent": _USER_AGENT, "Referer": host + "/"}
-        for key in ("headers", "header", "requestHeaders", "request_headers"):
-            raw = line.get(key)
-            if isinstance(raw, dict):
-                for k, v in raw.items():
-                    name, value = _text(k), _text(v)
-                    if name and value:
-                        headers[name] = value
-            elif isinstance(raw, str) and raw.strip().startswith("{"):
-                try:
-                    obj = json.loads(raw)
-                    if isinstance(obj, dict):
-                        for k, v in obj.items():
-                            name, value = _text(k), _text(v)
-                            if name and value:
-                                headers[name] = value
-                except (ValueError, TypeError):
-                    pass
-        return headers
+        # 1) 已经是直链媒体地址，直接交给播放器
+        if token.startswith('http'):
+            low = token.lower()
+            if low.startswith(self.site_url) and ('/player/' in low or '/v1/' in low):
+                # 这是站点页面/接口地址，不是媒体流，交给外部解析
+                return {'parse': 1, 'url': token, 'header': play_header}
+            if self._is_valid_video_url(token):
+                return {'parse': 0, 'url': token, 'header': play_header}
+            return {'parse': 1, 'url': token, 'header': play_header}
 
-    def playerContent(self, flag: Any, id: Any,
-                      vipFlags: Any = None) -> Dict[str, Any]:
-        flag_text = _piece(flag)
-        play_id = self._clean_id(id)
-        result = _empty_player(flag_text, play_id)
-        if not play_id:
-            return result
-        if _is_http(play_id):
-            result["url"] = play_id
-            result["header"] = {"User-Agent": _USER_AGENT}
-            return result
-        try:
-            lines = self._lines(play_id)
-            selected, ticket_mode = self._select_lines(lines)
-            if ticket_mode:
-                # 存在 resolve_ticket 源：只使用这类源，并完成二次播放解析
-                line = self._pick_line_by_flag(selected, flag_text)
-                resolved = self._resolve_ticket_line(line) if line else None
-                if not resolved:
-                    # 票据过期时刷新线路后重试一次
-                    for stale in selected:
-                        old_ticket = _text(stale.get("_ticket"))
-                        if old_ticket:
-                            self._http.invalidate(
-                                "ticket:"
-                                + hashlib.sha1(old_ticket.encode("utf-8")).hexdigest()
-                            )
-                    fresh = self._lines(play_id, refresh=True)
-                    selected2, mode2 = self._select_lines(fresh)
-                    if mode2:
-                        retry_line = self._pick_line_by_flag(selected2, flag_text)
-                        resolved = (self._resolve_ticket_line(retry_line)
-                                    if retry_line else None)
-                if not resolved:
-                    return result
-                line = resolved
-            else:
-                # 不存在票据源：展示并使用其他视频源
-                line = self._pick_line(selected, flag_text)
-                if not line:
-                    return result
-            url = _text(line.get("url"))
-            if not _is_http(url):
-                return result
-            result["url"] = url
-            result["header"] = self._line_headers(line, self._host)
-            result["flag"] = self._line_label(line) or flag_text
-            kind = _text(line.get("url_kind"))
-            if kind == "m3u8" or ".m3u8" in url:
-                result["contentType"] = "application/vnd.apple.mpegurl"
-            elif kind == "mp4" or ".mp4" in url:
-                result["contentType"] = "video/mp4"
-            return result
-        except Exception:
-            return result
+        # 2) 兼容旧版 20 位十六进制 token（站点早期格式，需补 YJ- 前缀）
+        if len(token) == 20 and all(c in '0123456789abcdefABCDEF' for c in token):
+            token = 'YJ-' + token
 
+        # 3) 当前 token 形如 av_xxx，一律走 playback/resolve
+        cache = getattr(self, '_resolve_cache', None)
+        if cache is None:
+            cache = self._resolve_cache = {}
+        if token in cache:
+            line_options = cache[token]
+        else:
+            resolve_path = '/v1/playback/resolve/{0}'.format(urllib.parse.quote(token, safe=''))
+            resolve_data = self._api_get(resolve_path)
+            line_options = (resolve_data or {}).get('line_options') or []
+            if line_options:
+                if len(cache) > 200:
+                    cache.clear()
+                cache[token] = line_options
+        if not line_options:
+            return {'parse': 1, 'url': page_url(), 'header': play_header}
 
-# --------------------------------------------------------------------------- #
-# 模块级入口（兼容按函数名加载的 py 采集器）
-# --------------------------------------------------------------------------- #
+        def is_selected(opt):
+            if selected_provider:
+                if opt.get('provider_id') == selected_provider:
+                    return True
+                if opt.get('play_from') == selected_provider:
+                    return True
+                if opt.get('provider_name') == selected_provider:
+                    return True
+            if flag and opt.get('provider_name') == flag:
+                return True
+            return False
 
-spider = Spider()
+        # 站点对部分内容要求登录：缓存已判定为受限的 token，避免每次播放都撞一串 401
+        gated = getattr(self, '_gated_tokens', None)
+        if gated is None:
+            gated = self._gated_tokens = set()
+        if token in gated:
+            return {'parse': 1, 'url': page_url(), 'header': play_header}
 
+        ticket_cands = []
+        for line in line_options:
+            ticket = self._ticket_of(line)
+            if ticket:
+                ticket_cands.append((line, ticket))
 
-def init(*args: Any, **kwargs: Any) -> str:
-    return spider.init(*args, **kwargs)
+        if ticket_cands:
+            # 有官方线路时只走官方线路，保持接口顺序，仅把「用户所选线路」提到最前
+            cands = ticket_cands
+            mode = 'ticket'
+        else:
+            # 长尾片源没有官方线路，退回直链，否则整条记录无法播放
+            if not DIRECT_FALLBACK_WHEN_NO_TICKET:
+                return {'parse': 1, 'url': page_url(), 'header': play_header}
+            mode = 'direct'
+            cands = []
+            for line in line_options:
+                url = (line.get('url') or '').strip()
+                if url.startswith('http') and self._is_valid_video_url(url):
+                    cands.append((line, url))
+        if not cands:
+            return {'parse': 1, 'url': page_url(), 'header': play_header}
 
+        cands.sort(key=lambda x: 0 if is_selected(x[0]) else 1)  # 稳定排序，其余仍是接口顺序
 
-def getName() -> str:
-    return spider.getName()
+        tried = 0
+        relogin_tried = False
+        for line, val in cands:
+            if mode == 'direct':
+                if tried >= 2:
+                    break
+                tried += 1
+                if tried < len(cands) and self._probe_direct(val) is False:
+                    continue
+                return {'parse': 0, 'url': val, 'header': play_header}
 
+            if tried >= 6:
+                break
+            tried += 1
+            real_url, need_login = self._resolve_ticket(val)
+            if need_login:
+                # 会话失效/未登录：有账号就先自动登录一次，再重试当前线路
+                if not relogin_tried and self._account and self._password and self._login():
+                    relogin_tried = True
+                    real_url, need_login = self._resolve_ticket(val)
+                    if real_url:
+                        return {'parse': 0, 'url': real_url, 'header': play_header}
+                    if not need_login:
+                        continue
+                # 官方线路占绝大多数，一条 401 基本可判定该集需要登录
+                gated.add(token)
+                break
+            if not real_url:
+                continue
+            # m3u8 清单做一次轻量探活，跳过已失效的 CDN；mp4 不探测，避免整片下载
+            if tried < len(cands) and self._probe_direct(real_url) is False:
+                continue
+            return {'parse': 0, 'url': real_url, 'header': play_header}
 
-def homeContent(filter: Any = False) -> Dict[str, Any]:
-    return spider.homeContent(filter)
-
-
-def homeVideoContent() -> Dict[str, Any]:
-    return spider.homeVideoContent()
-
-
-def categoryContent(tid: Any, pg: Any = 1, filter: Any = False,
-                    extend: Any = None) -> Dict[str, Any]:
-    return spider.categoryContent(tid, pg, filter, extend)
-
-
-def detailContent(ids: Any) -> Dict[str, Any]:
-    return spider.detailContent(ids)
-
-
-def searchContent(key: Any, quick: Any = False, pg: Any = 1) -> Dict[str, Any]:
-    return spider.searchContent(key, quick, pg)
-
-
-def playerContent(flag: Any, id: Any, vipFlags: Any = None) -> Dict[str, Any]:
-    return spider.playerContent(flag, id, vipFlags)
-
-
-if __name__ == "__main__":
-    import sys
-    try:
-        instance = Spider()
-        probe = instance.homeContent(False)
-        ok = isinstance(probe, dict) and isinstance(probe.get("list"), list) \
-            and isinstance(probe.get("class"), list) and bool(probe.get("class")) \
-            and instance._http.ensure_login()
-        sys.exit(0 if ok else 1)
-    except Exception:
-        sys.exit(1)
+        # 4) 全部线路都不可用（需要登录 / 无票），退回站点播放页
+        return {'parse': 1, 'url': page_url(), 'header': play_header}
