@@ -57,16 +57,17 @@ TVBox 每页条数一致（默认 20），因此一页对应一次请求，用 n
 
 首页加载加速
 ------------
-1. init 返回前只起一个后台线程预热：bootstrap / 登录 / 首页 feed 三个请求
-   全部并行发出（feed 匿名即可取到，不必排在登录之后），init 本身绝不等待
-   网络。
-2. homeContent 只在完全没有快照时做一次有上限的等待（默认 3 秒，由 extend 的
-   home_deadline 覆盖）；其余情况直接读进程内缓存，含已过期快照（最长 6 小时）。
-3. 缓存统一走 stale-while-revalidate：命中过期快照时先返回旧数据、后台刷新，
-   所以「每次进入首页」不会再重新付一次网络等待。
-4. 首页路径的请求都用短超时（home_timeout，默认 6 秒）且不重试；登录得到的会话
-   cookie 在进程内复用，不再每次进首页都重新登录。
-5. homeVideoContent 走同一套缓存，取不到时回退到已缓存的首页 feed。
+1. 首页不用缓存：每次进首页都重新取一遍（分类/筛选来自 bootstrap，海报来自
+   feed），保证看到的就是当下数据。
+2. homeContent 把 bootstrap 与 feed 两个请求并行发出，只等这两项（上限
+   home_deadline，默认 3 秒）；不做「先登录、再取数据」的串行流程。
+3. 登录不在首页路径上：feed 匿名即可取到，登录交给后台，只为详情/播放提前
+   备好会话。
+4. 真正的提速来源是连接复用（_KeepAlivePool）：省掉每个请求一次 TCP+TLS
+   握手（实测这个站点单次握手就要 0.5~2 秒）。
+5. homeVideoContent 同样每次现拉更新榜，短超时、零重试。
+
+其余接口（播放解析结果、登录会话）仍有进程内 TTL 缓存，但首页不参与。
 """
 
 import calendar
@@ -141,18 +142,11 @@ _ACCOUNT_POOL = tuple(
     + [("dongpianai%02d" % i,) * 2 for i in range(1, 10)]
 )
 
-# 进程内共享缓存：跨 Spider 实例复用静态配置与首页快照，按 host 隔离；不写磁盘
+# 进程内共享缓存：跨 Spider 实例复用登录会话与播放解析结果，按 host 隔离；不写磁盘
 _SHARED_CACHE = {}          # type: Dict[str, Tuple[Any, float]]
 _SHARED_CACHE_LOCK = threading.RLock()
 
-# 过期快照的可用窗口与「首页预热」状态：过期的首页数据仍然可用，
-# 命中时先返回、再后台刷新，避免每次进入首页都等一次完整请求。
-_STALE_TTL = 21600.0
-_HOME_SNAPSHOT_STALE = 21600.0
-# host -> Event：同一 host 只允许一个预热任务在跑，多个调用方共享同一个 Event
-_HOME_WARM = {}             # type: Dict[str, threading.Event]
-_HOME_WARM_LOCK = threading.RLock()
-# 后台刷新任务去重：同名任务在跑时不再重复起线程
+# 后台任务去重：同名任务在跑时不再重复起线程
 _BG_TASKS = {}              # type: Dict[str, bool]
 _BG_LOCK = threading.RLock()
 
@@ -569,6 +563,23 @@ class _KeepAlivePool(object):
                     return
         self._close(conn)
 
+    def warm(self, count: int = 2, timeout: float = 6.0) -> None:
+        """预先建好若干条空闲连接（含 TCP + TLS 握手），回填进池子。
+
+        只是把连接备好，不取任何数据、不缓存任何内容：首页第一次请求就能直接
+        复用，省掉冷启动时那 0.5~2 秒的握手。
+        """
+        made = []                              # type: List[Any]
+        for _ in range(max(0, int(count))):
+            try:
+                conn = self._new(timeout)
+                conn.connect()
+                made.append(conn)
+            except Exception:
+                break
+        for conn in made:
+            self.release(conn, True)
+
     def close_all(self) -> None:
         with self._lock:
             while self._idle:
@@ -624,6 +635,15 @@ class _Http(object):
         self._cache_lock = _SHARED_CACHE_LOCK
         # 复用进程内上一次登录的会话，新建实例不必重新登录
         self._restore_session()
+
+    def warm_connections(self, count: int = 2) -> None:
+        """后台预建连接（不取数据），让首页的首个请求省掉握手时间。"""
+        if not self._pool_ok:
+            return
+        try:
+            self._keepalive.warm(count, min(self.timeout, 8.0))
+        except Exception:
+            pass
 
     # -- 登录与会话 cookie ---------------------------------------------------- #
 
@@ -1025,7 +1045,7 @@ class _Http(object):
                 return {}, 0
         return {}, status
 
-    # -- 简单 TTL 缓存 ------------------------------------------------------- #
+    # -- 简单 TTL 缓存（只用于播放解析等非首页数据）------------------------- #
 
     def cached(self, key: str, ttl: float, producer) -> Any:
         now = time.time()
@@ -1034,28 +1054,6 @@ class _Http(object):
             hit = self._cache.get(cache_key)
         if hit and hit[1] > now:
             return hit[0]
-        return self._fetch_cache(key, ttl, producer)
-
-    def cached_swr(self, key: str, ttl: float, producer,
-                   stale_ttl: float = _STALE_TTL) -> Any:
-        """stale-while-revalidate 缓存。
-
-        - 新鲜：直接返回，零网络；
-        - 已过期但不超过 stale_ttl：立刻返回旧值，并起后台线程刷新；
-        - 完全没有记录：同步拉一次（调用方自行控制是否在关键路径上）。
-        """
-        now = time.time()
-        cache_key = self._cache_key(key, self.host)
-        with self._cache_lock:
-            hit = self._cache.get(cache_key)
-        if hit:
-            value, expire = hit[0], hit[1]
-            if expire > now:
-                return value
-            if (now - expire) <= stale_ttl:
-                _spawn_bg("swr:" + cache_key,
-                          lambda: self._fetch_cache(key, ttl, producer))
-                return value
         return self._fetch_cache(key, ttl, producer)
 
     def _fetch_cache(self, key: str, ttl: float, producer) -> Any:
@@ -1075,28 +1073,6 @@ class _Http(object):
                     self._cache.pop(k, None)
             self._cache[cache_key] = (value, now + effective)
         return value
-
-    def refresh(self, key: str, ttl: float, producer) -> Any:
-        """强制走一次 producer 并写回缓存（供后台刷新/首次同步拉取使用）。"""
-        return self._fetch_cache(key, ttl, producer)
-
-    def peek(self, key: str, max_age: float = 0.0) -> Any:
-        """只读缓存，绝不发起网络请求（用于不能被网络阻塞的路径）。
-
-        max_age > 0 时允许读到「已过期但未超出 max_age 秒」的旧快照，
-        这是首页能秒开的关键：过期数据先顶上，刷新交给后台。
-        """
-        now = time.time()
-        cache_key = self._cache_key(key, self.host)
-        with self._cache_lock:
-            hit = self._cache.get(cache_key)
-        if not hit:
-            return None
-        if hit[1] > now:
-            return hit[0]
-        if max_age > 0 and hit[0] and (now - hit[1]) <= max_age:
-            return hit[0]
-        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1173,8 +1149,7 @@ class Spider(_BaseSpider):
         self._timeout = float(_text(ext.get("timeout"), "12") or "12")
         self._retries = _int(ext.get("retries"), 1)
         self._page_size = _positive(ext.get("page_size"), 20, 50)
-        # 首页预热的最长等待时间：超时只影响首页影片列表，不影响分类/筛选；
-        # 默认 3 秒，慢网可调大，最快可到 1 秒（其余内容由后台预热补齐）
+        # 首页现拉数据的最长等待时间：默认 3 秒，慢网可调大（1~15 秒）
         try:
             self._home_deadline = float(_text(ext.get("home_deadline"), "3") or "3")
         except (TypeError, ValueError):
@@ -1191,16 +1166,18 @@ class Spider(_BaseSpider):
         self._password = _text(ext.get("password")) or self._account
         self._accounts = _normalize_accounts(ext.get("accounts")) or _ACCOUNT_POOL
         new_cfg = self._config_snapshot()
-        # 配置未变时复用既有会话与已预热缓存，避免重复登录和重新拉取首页
+        # 配置未变时复用既有会话，避免重复登录
         previous = getattr(self, "_cfg", None)
         if new_cfg == previous and getattr(self, "_http", None) is not None:
             self._cfg = new_cfg
-            self._warm_home(0.0)
             return ""
         self._cfg = new_cfg
         self._http = self._new_http()
-        # init 不登录、不等待网络：立刻起后台预热，等用户真正进首页时缓存已热
-        self._warm_home(0.0)
+        # init 不登录、不等待网络：后台先备好会话与空闲连接。首页不缓存数据，
+        # 但连接是复用的，提前把 TCP+TLS 握手做掉，第一次进首页就能直接发请求。
+        _spawn_bg("login:" + self._host, self._http.ensure_login)
+        _spawn_bg("warm:" + self._host,
+                  lambda: self._http.warm_connections(2))
         return ""
 
     def getName(self) -> str:
@@ -1209,20 +1186,10 @@ class Spider(_BaseSpider):
     # -- 配置 / 分类 / 筛选 -------------------------------------------------- #
 
     def _bootstrap(self) -> Dict[str, Any]:
-        def load():
-            obj, _ = self._http.request("GET", "/v1/runtime/bootstrap", signed=False,
-                                        timeout=self._home_timeout, retries=0)
-            return obj
-        # 过期快照先顶上、后台刷新：分类与筛选永远不会因为配置接口慢而卡首页
-        return self._http.cached_swr("runtime.bootstrap", 300.0, load,
-                                     stale_ttl=_HOME_SNAPSHOT_STALE)
-
-    def _bootstrap_view(self, allow_fetch: bool) -> Dict[str, Any]:
-        """取运行时配置：allow_fetch=True 走缓存/请求，False 时只读缓存不联网。"""
-        if allow_fetch:
-            return self._bootstrap()
-        return _as_dict(self._http.peek("runtime.bootstrap",
-                                        max_age=_HOME_SNAPSHOT_STALE))
+        """运行时配置（分类 / 筛选的定义）。首页每次进都重新取，不用缓存。"""
+        obj, _ = self._http.request("GET", "/v1/runtime/bootstrap", signed=False,
+                                    timeout=self._home_timeout, retries=0)
+        return _as_dict(obj)
 
     def _categories_from(self, boot: Dict[str, Any]) -> List[Dict[str, str]]:
         ui = _as_dict(_as_dict(boot).get("catalog_ui"))
@@ -1237,27 +1204,6 @@ class Spider(_BaseSpider):
             out.append({"type_id": tid,
                         "type_name": _first(c.get("label"), tid)})
         return out
-
-    def _build_categories(self) -> List[Dict[str, str]]:
-        return self._categories_from(self._bootstrap())
-
-    def _categories(self, allow_fetch: bool = True) -> List[Dict[str, str]]:
-        """分类标签。allow_fetch=False 时只读缓存，绝不触发网络。"""
-        raw = (self._http.cached_swr("categories", 300.0, self._build_categories,
-                                     stale_ttl=_HOME_SNAPSHOT_STALE)
-               if allow_fetch else self._categories_from(self._bootstrap_view(False)))
-        result = []
-        seen = set()
-        for item in _as_list(raw):
-            obj = _as_dict(item)
-            tid = _text(obj.get("type_id"))
-            if not tid or tid in seen:
-                continue
-            seen.add(tid)
-            result.append({"type_id": tid,
-                           "type_name": _first(obj.get("type_name"), tid)})
-        # 缓存没热起来时也必须给出完整的分类，播放端才不会出现"分类空白"
-        return result or [dict(x) for x in _FALLBACK_CATEGORIES]
 
     def _filters_from(self, boot: Dict[str, Any]) -> Dict[str, Any]:
         ui = _as_dict(_as_dict(boot).get("catalog_ui"))
@@ -1290,22 +1236,6 @@ class Spider(_BaseSpider):
             if rows:
                 out[kind] = rows
         return out
-
-    def _build_filters(self) -> Dict[str, Any]:
-        return self._filters_from(self._bootstrap())
-
-    def _filters(self, allow_fetch: bool = True) -> Dict[str, Any]:
-        """筛选定义。allow_fetch=False 时只读缓存，绝不触发网络。"""
-        raw = (self._http.cached_swr("filters", 300.0, self._build_filters,
-                                     stale_ttl=_HOME_SNAPSHOT_STALE)
-               if allow_fetch else self._filters_from(self._bootstrap_view(False)))
-        result = {}
-        if isinstance(raw, dict):
-            for kind, rows in raw.items():
-                cloned = _clone_filter_rows(rows)
-                if cloned:
-                    result[_text(kind)] = cloned
-        return result
 
     @staticmethod
     def _fill_filters(filters: Any, categories: List[Dict[str, str]]) -> Dict[str, Any]:
@@ -1396,108 +1326,61 @@ class Spider(_BaseSpider):
     # -- 首页 ---------------------------------------------------------------- #
 
     def _home_feed(self) -> Dict[str, Any]:
+        """首页 feed：匿名即可取到，短超时、零重试。"""
         params = {"scope": "public", "mode": "preview", "sections": 3, "cards": 10}
-
-        def load():
-            # 首页 feed 匿名就能取到（实测与登录返回的板块/卡片逐条一致），
-            # 所以立刻发出、绝不排在登录后面；短超时、零重试。
+        obj, _ = self._http.request("GET", "/v1/feed/home", dict(params),
+                                    need_auth=False,
+                                    timeout=self._home_timeout, retries=0)
+        if _as_list(_as_dict(obj).get("sections")):
+            return _as_dict(obj)
+        # 站点将来若收紧成必须登录：补一次会话再试
+        if self._http.ensure_login():
             obj, _ = self._http.request("GET", "/v1/feed/home", dict(params),
-                                        need_auth=False,
                                         timeout=self._home_timeout, retries=0)
-            if _as_list(_as_dict(obj).get("sections")):
-                return obj
-            # 站点将来若收紧成必须登录：补一次会话再试，不影响现在的快路径
-            if self._http.ensure_login():
-                obj, _ = self._http.request("GET", "/v1/feed/home", dict(params),
-                                            timeout=self._home_timeout, retries=0)
-            return obj
+        return _as_dict(obj)
 
-        result = self._http.cached_swr("home.feed", 300.0, load,
-                                       stale_ttl=_HOME_SNAPSHOT_STALE)
-        return result if isinstance(result, dict) else {}
-
-    def _home_vods(self, allow_fetch: bool = True) -> List[Dict[str, Any]]:
-        feed = (self._home_feed() if allow_fetch
-                else _as_dict(self._http.peek("home.feed",
-                                              max_age=_HOME_SNAPSHOT_STALE)))
+    def _vods_from_feed(self, feed: Any) -> List[Dict[str, Any]]:
         cards = []
-        for section in _as_list(feed.get("sections")):
+        for section in _as_list(_as_dict(feed).get("sections")):
             cards.extend(_as_list(_as_dict(section).get("cards")))
         return self._cards_to_vods(cards)
 
-    # -- 首页预热 ------------------------------------------------------------ #
+    def _fetch_home_pair(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """bootstrap 与 feed 并行现拉，最多等 home_deadline。
 
-    def _warm_home(self, wait_seconds: float = 0.0) -> None:
-        """启动（或复用）后台预热：bootstrap 与登录并行，随后拉首页 feed。
-
-        预热只写进程内缓存，不阻塞任何调用方；wait_seconds 仅决定调用方最多
-        等多久，网络再慢也不会超过这个上限。
+        首页不走缓存：每次进首页都重新取一遍，保证看到的就是当下数据。
         """
-        host = self._host
-        with _HOME_WARM_LOCK:
-            event = _HOME_WARM.get(host)
-            if event is None:
-                event = threading.Event()
-                _HOME_WARM[host] = event
+        pool = ThreadPoolExecutor(max_workers=2)
+        try:
+            f_boot = pool.submit(self._bootstrap)
+            f_feed = pool.submit(self._home_feed)
+            wait([f_boot, f_feed], timeout=self._home_deadline)
+            if not (f_boot.done() and f_feed.done()):
+                # 预算内没齐（冷启动要付两次 TCP+TLS 握手就会这样）：再等余下
+                # 预算，宁可慢一点也不能给用户一个空的首页
+                wait([f_boot, f_feed],
+                     timeout=max(0.0, self._home_timeout - self._home_deadline))
+
+            def _value(fut: Any) -> Dict[str, Any]:
                 try:
-                    threading.Thread(target=self._warm_runner, args=(host, event),
-                                     name="dp-home-warm", daemon=True).start()
+                    return _as_dict(fut.result()) if fut.done() else {}
                 except Exception:
-                    _HOME_WARM.pop(host, None)
-                    return
-        if wait_seconds > 0:
-            try:
-                event.wait(wait_seconds)
-            except Exception:
-                pass
+                    return {}
 
-    def _warm_runner(self, host: str, event: "threading.Event") -> None:
-        try:
-            self._warm_steps(event)
-        except Exception:
-            pass
-        finally:
-            with _HOME_WARM_LOCK:
-                if _HOME_WARM.get(host) is event:
-                    _HOME_WARM.pop(host, None)
-            event.set()
-
-    def _warm_steps(self, ready: "threading.Event" = None) -> None:
-        # 三个请求互不依赖，全部并行发出：
-        #   bootstrap —— 分类/筛选（不需要会话）
-        #   login     —— 备好会话 cookie（给后续详情/播放用）
-        #   feed      —— 首页海报（匿名即可取到，不等登录）
-        # 首页只要 bootstrap + feed 就够渲染，所以这两项一完成就放行调用方，
-        # 登录继续在后台跑，不影响首页首次出图。
-        pool = ThreadPoolExecutor(max_workers=3)
-        try:
-            boot = pool.submit(self._bootstrap)
-            login = pool.submit(self._http.ensure_login)
-            feed = pool.submit(self._home_feed)
-            try:
-                wait([boot, feed], timeout=self._home_timeout + 1.0)
-            except Exception:
-                pass
-            if ready is not None:
-                ready.set()
-            try:
-                login.result(timeout=self._home_timeout + 1.0)
-            except Exception:
-                pass
+            boot, feed = _value(f_boot), _value(f_feed)
         finally:
             pool.shutdown(wait=False)
+        return boot, feed
 
     def homeContent(self, filter: Any = False) -> Dict[str, Any]:
-        # 有快照就直接返回（即使已过期，也是本地数据），零等待；只有完全
-        # 没有快照时才做一次有上限的等待，其余交给后台预热补齐。
-        snapshot = self._http.peek("home.feed", max_age=_HOME_SNAPSHOT_STALE)
-        self._warm_home(0.0 if snapshot else self._home_deadline)
-        classes = self._categories(allow_fetch=False)
+        boot, feed = self._fetch_home_pair()
+        classes = (self._categories_from(boot)
+                   or [dict(x) for x in _FALLBACK_CATEGORIES])
         try:
             return {
                 "class": classes,
-                "filters": self._fill_filters(self._filters(allow_fetch=False), classes),
-                "list": self._home_vods(allow_fetch=False),
+                "filters": self._fill_filters(self._filters_from(boot), classes),
+                "list": self._vods_from_feed(feed),
             }
         except Exception:
             return {"class": classes,
@@ -1511,26 +1394,10 @@ class Spider(_BaseSpider):
         )
         return vods
 
-    def _refresh_home_video(self) -> None:
-        _spawn_bg("homevideo:" + self._host, lambda: self._http.refresh(
-            "home.video", 600.0, self._load_home_video))
-
     def homeVideoContent(self) -> Dict[str, Any]:
-        """首页影片列表：新鲜缓存零成本；旧快照或首页 feed 先顶上，列表后台补。"""
+        """首页影片列表：同样不缓存，每次取最新的更新榜。"""
         try:
-            fresh = _as_list(self._http.peek("home.video"))
-            if fresh:
-                return {"list": fresh}
-            fallback = (_as_list(self._http.peek("home.video",
-                                                 max_age=_HOME_SNAPSHOT_STALE))
-                        or self._home_vods(allow_fetch=False))
-            if fallback:
-                self._refresh_home_video()
-                return {"list": fallback}
-            # 首次且没有任何快照：只能等一次列表接口（短超时、不重试）
-            vods = _as_list(self._http.refresh(
-                "home.video", 600.0, self._load_home_video))
-            return {"list": vods or self._home_vods(allow_fetch=False)}
+            return {"list": _as_list(self._load_home_video())}
         except Exception:
             return {"list": []}
 
