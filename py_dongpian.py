@@ -181,6 +181,7 @@ _KIND_LABELS = {
     "series": "电视剧",
     "anime": "动漫",
     "variety": "综艺",
+    "short_drama": "短剧",
 }
 _KIND_IDS = tuple(_KIND_LABELS.keys())
 
@@ -191,6 +192,7 @@ _FALLBACK_CATEGORIES = [
     {"type_id": "movie", "type_name": "电影"},
     {"type_id": "anime", "type_name": "动漫"},
     {"type_id": "variety", "type_name": "综艺"},
+    {"type_id": "short_drama", "type_name": "短剧"},
 ]
 
 # ---- 最近更新实现 -------------------------------------------------- #
