@@ -48,52 +48,26 @@ TVBox 每页条数一致（默认 20），因此一页对应一次请求，用 n
    取一个，失败自动换账号重试；可用 init({"account", "password"}) 固定单账号，
    或 init({"accounts": [...]}) 自定义账号池。保存响应返回的 Set-Cookie，
    并在之后所有接口请求头中统一携带该 Cookie；票据解析依赖此会话。
-   会话有效期以服务端登录响应里的 expires_at 为准（当前约一年），进程内一直
-   复用、不做本地过期；只有服务端返回 401/403 时才丢弃并重新登录。
 2. 线路优选：优先识别 url_kind == "resolve_ticket" 的视频源。存在这类源时，
    只保留并展示它们、过滤其余源，播放时通过
    POST /v1/playback/resolve-line?view=compact 二次解析换取真实可播地址；
    不存在票据源时，展示并使用其他视频源。
-
-首页加载加速
-------------
-1. 首页文件缓存：第一次拉到内容后，把分类/筛选/海报落一份 JSON 文件，位置固定为
-   Android 公共下载目录 /storage/emulated/0/Download（dongpian_home.json、
-   dongpian_homevideo.json；目录不存在就先创建，不再尝试任何其它目录；桌面本地
-   跑则放在 py 所在目录）。之后每次进首页先直接读文件、立即返回，同时起后台任务
-   重新拉 bootstrap+feed 并覆盖文件——所以看到的是"上次拉到的最新"，而下一次进
-   首页拿到的又是更新的。播放端重启、py 模块重新下载都照样命中（缓存不依赖模块
-   路径）。该目录不可写时就不缓存（功能照常）。文件超过一周、host 对不上、或结构
-   不对，视为没有缓存，走同步拉取。
-2. homeContent 把 bootstrap 与 feed 两个请求并行发出，只等这两项（上限
-   home_deadline，默认 3 秒）；不做「先登录、再取数据」的串行流程。
-3. 登录不在首页路径上：feed 匿名即可取到，登录交给后台，只为详情/播放提前
-   备好会话。
-4. 真正的提速来源是连接复用（_KeepAlivePool）：省掉每个请求一次 TCP+TLS
-   握手（实测这个站点单次握手就要 0.5~2 秒）。
-5. homeVideoContent 同样先读文件缓存、后台刷新更新榜。
-
-其余接口（播放解析结果、登录会话）仍有进程内 TTL 缓存，首页走磁盘文件缓存。
 """
 
 import calendar
 import hashlib
 import hmac
-import http.client
 import json
 import math
-import os
 import re
 import secrets
-import ssl
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, wait
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_tz
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -134,13 +108,6 @@ _LOGIN_PATH = "/v1/users/password/login"
 _RESOLVE_LINE_PATH = "/v1/playback/resolve-line?view=compact"
 _LOGIN_RETRY_INTERVAL = 60.0
 _LOGIN_ACCOUNT_ATTEMPTS = 3
-# 单次登录尝试的超时与多次尝试的总预算：站点慢时宁可放弃本次登录（首页仍可
-# 用缓存兜底），也不要让首次请求卡住十几秒
-_LOGIN_ATTEMPT_TIMEOUT = 4.0
-_LOGIN_BUDGET = 9.0
-# 会话 cookie 在进程内一直复用：有效期直接取服务端登录响应里的 expires_at
-# （当前站点给到一年后），进程内不做本地过期；只有服务端返回 401/403 才丢弃重登。
-_SESSION_FALLBACK_TTL = float("inf")
 
 # 默认账号池：现有 1 个 + dongpianai01..dongpianai09，共 10 个，密码与账号同名
 _ACCOUNT_POOL = tuple(
@@ -148,158 +115,9 @@ _ACCOUNT_POOL = tuple(
     + [("dongpianai%02d" % i,) * 2 for i in range(1, 10)]
 )
 
-# 进程内共享缓存：跨 Spider 实例复用登录会话与播放解析结果，按 host 隔离；不写磁盘
+# 进程内共享缓存：跨 Spider 实例复用静态配置与首页快照，按 host 隔离；不写磁盘
 _SHARED_CACHE = {}          # type: Dict[str, Tuple[Any, float]]
 _SHARED_CACHE_LOCK = threading.RLock()
-
-# 后台任务去重：同名任务在跑时不再重复起线程
-_BG_TASKS = {}              # type: Dict[str, bool]
-_BG_LOCK = threading.RLock()
-
-
-def _spawn_bg(name: str, fn: Any) -> None:
-    """起一个守护线程做后台刷新；同名任务已在跑时直接跳过。"""
-    with _BG_LOCK:
-        if name in _BG_TASKS:
-            return
-        _BG_TASKS[name] = True
-
-    def run() -> None:
-        try:
-            fn()
-        except Exception:
-            pass
-        finally:
-            with _BG_LOCK:
-                _BG_TASKS.pop(name, None)
-
-    try:
-        threading.Thread(target=run, name="dp-bg", daemon=True).start()
-    except Exception:
-        with _BG_LOCK:
-            _BG_TASKS.pop(name, None)
-
-
-# ---- 首页文件缓存 ---------------------------------------------------------- #
-# 播放端每次打开都会重建 py 模块（py 用 gitee 链接在线加载时更容易如此），
-# 进程内缓存跟着清空，所以首页内容额外落一份 JSON 文件：有文件就先读文件秒出，
-# 同时后台重新拉一遍覆盖，下次进首页即最新。
-# 位置固定为 Android 公共下载目录 /storage/emulated/0/Download（不存在就先创建），
-# 不再去试任何其它目录；桌面本地跑则放在 py 所在目录。
-_CACHE_FIXED = "/storage/emulated/0/Download"
-_CACHE_PREFIX = "dongpian"
-_HOME_FILE_MAX_AGE = 7 * 86400.0   # 文件超过一周视为无效（站点结构可能已变）
-_HOME_REFRESH_MIN_GAP = 20.0      # 两次后台刷新之间的最小间隔（防重进首页抖动）
-_CACHE_DIR = ""
-_CACHE_DIR_LOCK = threading.RLock()
-_DISK_LOCK = threading.RLock()
-_HOME_REFRESH_AT = 0.0
-_MODULE_TS = time.time()          # 模块加载时刻（诊断用：判断慢在加载还是在请求）
-
-
-def _is_android() -> bool:
-    """Android 进程一定带 ANDROID_DATA 环境变量，桌面系统没有。"""
-    return bool(os.environ.get("ANDROID_DATA"))
-
-
-def _local_dir() -> str:
-    """桌面本地跑 py 时的缓存目录：py 所在目录（在线加载没有 __file__ 时用工作目录）。"""
-    try:
-        return os.path.dirname(os.path.abspath(__file__))
-    except Exception:
-        try:
-            return os.getcwd()
-        except Exception:
-            return ""
-
-
-def _cache_dir() -> str:
-    """只有一个位置：Android 固定 /storage/emulated/0/Download，桌面用 py 所在目录。
-
-    目录不存在就先创建；不可写则返回空串（不缓存，功能照常），不退回其它目录。
-    """
-    global _CACHE_DIR
-    with _CACHE_DIR_LOCK:
-        if _CACHE_DIR:
-            return _CACHE_DIR
-        path = _CACHE_FIXED if _is_android() else _local_dir()
-        try:
-            if not os.path.isdir(path):
-                os.makedirs(path)
-            probe = os.path.join(path, "." + _CACHE_PREFIX + ".probe")
-            with open(probe, "w", encoding="utf-8") as fh:
-                fh.write("1")
-            os.remove(probe)
-            _CACHE_DIR = path
-        except Exception:
-            _CACHE_DIR = ""
-        return _CACHE_DIR
-
-
-def _cache_file(name: str) -> str:
-    """缓存文件路径：<缓存目录>/dongpian_<name>.json；目录不可用时返回空串。"""
-    folder = _cache_dir()
-    if not folder:
-        return ""
-    return os.path.join(folder, "%s_%s.json" % (_CACHE_PREFIX, name))
-
-
-def _diag_write(kind: str, info: Dict[str, Any]) -> None:
-    """把入口耗时写进 dongpian_diag.json，排查"明明有缓存还是慢"用。"""
-    path = _cache_file("diag")
-    if not path:
-        return
-    try:
-        data = _file_read(path)
-        data[kind] = info
-        data["module_ago_ms"] = int((time.time() - _MODULE_TS) * 1000)
-        _file_write(path, data)
-    except Exception:
-        pass
-
-
-def _cleanup_tmp(path: str) -> None:
-    """进程在写盘中途被杀会留下 .tmp，下次读这个文件时顺手清掉（超过 1 分钟的）。"""
-    try:
-        tmp = path + ".tmp"
-        if os.path.exists(tmp) and time.time() - os.stat(tmp).st_mtime > 60:
-            os.remove(tmp)
-    except Exception:
-        pass
-
-
-def _file_read(path: str, max_age: float = 0.0) -> Dict[str, Any]:
-    """读缓存文件；不存在 / 结构不对 / 太旧一律当成没有。"""
-    if not path:
-        return {}
-    try:
-        with _DISK_LOCK:
-            if max_age > 0 and time.time() - os.stat(path).st_mtime > max_age:
-                return {}
-            with open(path, "r", encoding="utf-8") as fh:
-                obj = json.load(fh)
-        _cleanup_tmp(path)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        _cleanup_tmp(path)
-        return {}
-
-
-def _file_write(path: str, obj: Dict[str, Any]) -> None:
-    """原子写：先写临时文件再改名，读的一方永远看不到半个文件。"""
-    if not path:
-        return
-    tmp = path + ".tmp"
-    try:
-        with _DISK_LOCK:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(obj, fh, ensure_ascii=False)
-            os.replace(tmp, path)
-    except Exception:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
 
 _KIND_LABELS = {
     "movie": "电影",
@@ -498,22 +316,6 @@ def _date_only(value: Any) -> str:
     return m.group(1) if m else s[:19]
 
 
-def _epoch(value: Any) -> float:
-    """ISO8601 时间串 -> Unix 秒（兼容 ...Z 与 +08:00）；解析失败返回 0。"""
-    s = _text(value)
-    if not s:
-        return 0.0
-    try:
-        if s.endswith("Z") or s.endswith("z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except Exception:
-        return 0.0
-
-
 def _quote(value: Any) -> str:
     return urllib.parse.quote(_text(value), safe="-_.~")
 
@@ -628,93 +430,6 @@ def _empty_player(flag: str = "", vid: str = "") -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# 连接复用
-# --------------------------------------------------------------------------- #
-
-class _PoolSkip(Exception):
-    """本次请求不适合走复用连接（重定向、被禁用的代理等），交给 urllib。"""
-
-
-class _KeepAlivePool(object):
-    """最小 keep-alive 连接池：同一 host 复用 TCP/TLS，省掉每次请求的握手。
-
-    实测该站点一次新建连接要 0.5~2 秒（TLS 握手占大头），复用后单次请求只剩
-    服务端处理时间。任何复用失败都退回 urllib，不影响功能。
-    """
-
-    def __init__(self, origin: str, timeout: float = 12.0,
-                 idle_limit: int = 4, idle_ttl: float = 45.0) -> None:
-        parts = urllib.parse.urlsplit(origin)
-        self._https = (parts.scheme or "https").lower() != "http"
-        self._host = parts.hostname or ""
-        self._port = parts.port or (443 if self._https else 80)
-        self._idle = []                        # type: List[Tuple[Any, float]]
-        self._lock = threading.RLock()
-        self._idle_limit = max(1, idle_limit)
-        self._idle_ttl = idle_ttl
-
-    def _new(self, timeout: float) -> Any:
-        if self._https:
-            return http.client.HTTPSConnection(
-                self._host, self._port, timeout=timeout,
-                context=ssl.create_default_context())
-        return http.client.HTTPConnection(self._host, self._port, timeout=timeout)
-
-    @staticmethod
-    def _close(conn: Any) -> None:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    def acquire(self, timeout: float) -> Tuple[Any, bool]:
-        """取一条连接，返回 (连接, 是否来自池里的旧连接)。"""
-        now = time.time()
-        with self._lock:
-            while self._idle:
-                conn, used = self._idle.pop()
-                if (now - used) <= self._idle_ttl:
-                    try:
-                        if conn.sock is not None:
-                            conn.sock.settimeout(timeout)
-                    except Exception:
-                        pass
-                    return conn, True
-                self._close(conn)
-        return self._new(timeout), False
-
-    def release(self, conn: Any, reusable: bool) -> None:
-        if reusable:
-            with self._lock:
-                if len(self._idle) < self._idle_limit:
-                    self._idle.append((conn, time.time()))
-                    return
-        self._close(conn)
-
-    def warm(self, count: int = 2, timeout: float = 6.0) -> None:
-        """预先建好若干条空闲连接（含 TCP + TLS 握手），回填进池子。
-
-        只是把连接备好，不取任何数据、不缓存任何内容：首页第一次请求就能直接
-        复用，省掉冷启动时那 0.5~2 秒的握手。
-        """
-        made = []                              # type: List[Any]
-        for _ in range(max(0, int(count))):
-            try:
-                conn = self._new(timeout)
-                conn.connect()
-                made.append(conn)
-            except Exception:
-                break
-        for conn in made:
-            self.release(conn, True)
-
-    def close_all(self) -> None:
-        with self._lock:
-            while self._idle:
-                self._close(self._idle.pop()[0])
-
-
-# --------------------------------------------------------------------------- #
 # 签名 HTTP 客户端
 # --------------------------------------------------------------------------- #
 
@@ -738,40 +453,14 @@ class _Http(object):
         self._cookie_map = {}    # type: Dict[str, str]
         self._auth_cookie = ""
         self._login_lock = threading.RLock()
-        self._login_state = 0    # 0 未尝试/进行中 / 1 成功 / -1 失败
+        self._login_state = 0    # 0 未尝试 / 1 成功 / -1 失败
         self._login_at = 0.0
-        # 单飞：同一时刻只允许一个登录请求在飞，其它线程等它的结果，
-        # 避免并发预热时互相把对方当成“刚刚失败过”
-        self._login_inflight = False
-        self._login_event = None  # type: Optional[threading.Event]
         # 不使用 CookieProcessor，避免与统一注入的 Cookie 头产生重复
         self._opener = urllib.request.build_opener()
-        # 连接复用默认开启：TLS 握手是该站点最大的单次开销。只有用户用环境变量
-        # 显式指定了代理时才让 urllib 接管（它才认这些代理配置）；直连不通时
-        # 会连续失败两次后自动退回 urllib，功能不受影响。
-        env_proxy = ""
-        for name in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
-            if os.environ.get(name):
-                env_proxy = name
-                break
-        self._pool_ok = not env_proxy
-        self._pool_fails = 0
-        self._keepalive = _KeepAlivePool(self.host, self.timeout)
         self._clock_offset = 0.0
         self._lock = threading.RLock()
         self._cache = _SHARED_CACHE
         self._cache_lock = _SHARED_CACHE_LOCK
-        # 复用进程内上一次登录的会话，新建实例不必重新登录
-        self._restore_session()
-
-    def warm_connections(self, count: int = 2) -> None:
-        """后台预建连接（不取数据），让首页的首个请求省掉握手时间。"""
-        if not self._pool_ok:
-            return
-        try:
-            self._keepalive.warm(count, min(self.timeout, 8.0))
-        except Exception:
-            pass
 
     # -- 登录与会话 cookie ---------------------------------------------------- #
 
@@ -807,123 +496,35 @@ class _Http(object):
                 )
 
     def ensure_login(self, force: bool = False) -> bool:
-        """从账号池随机取一个登录；失败自动换账号重试，绝不抛异常。
-
-        同一时刻只有一个登录在飞：并发调用者会等这次登录的结果，而不是各自
-        再发一次请求（既省流量，也避免把并发请求误判成“重复登录”）。
-        """
-        pending = None
+        """从账号池随机取一个登录；失败自动换账号重试，绝不抛异常。"""
         with self._login_lock:
             if self._login_state == 1 and self._auth_cookie:
                 return True
             now = time.time()
-            if (not force and self._login_state == -1
-                    and (now - self._login_at) < _LOGIN_RETRY_INTERVAL):
-                # 刚失败过，短期内不再重试，调用方走缓存/匿名兜底
+            if not force and now - self._login_at < _LOGIN_RETRY_INTERVAL:
                 return False
-            if self._login_inflight:
-                pending = self._login_event
-            else:
-                self._login_inflight = True
-                self._login_at = now
-                self._login_event = threading.Event()
-        if pending is not None:
-            # 已有登录在飞：等它出结果（最多等一个预算周期）
-            pending.wait(_LOGIN_BUDGET + 2.0)
-            with self._login_lock:
-                return self._login_state == 1 and bool(self._auth_cookie)
+            self._login_at = now
         order = list(self.accounts or _ACCOUNT_POOL)
         try:
             secrets.SystemRandom().shuffle(order)
         except Exception:
             pass
         ok = False
-        login_obj = None   # type: Any
-        deadline = time.time() + _LOGIN_BUDGET
         for account, password in order[:_LOGIN_ACCOUNT_ATTEMPTS]:
-            remaining = deadline - time.time()
-            if remaining <= 1.0:
-                # 预算用完：放弃本次登录，调用方走缓存/兜底，不拖住首页
-                break
             try:
                 obj, status = self.request(
                     "POST", _LOGIN_PATH,
                     body={"account": account, "password": password},
-                    need_auth=False,
-                    timeout=min(self.timeout, _LOGIN_ATTEMPT_TIMEOUT, remaining),
+                    need_auth=False, timeout=min(self.timeout, 8.0),
                 )
                 if status in (200, 201) and obj and self._auth_cookie:
                     ok = True
-                    login_obj = obj
                     break
             except Exception:
                 continue
         with self._login_lock:
             self._login_state = 1 if ok else -1
-            self._login_inflight = False
-            event = self._login_event
-            self._login_event = None
-        if event is not None:
-            event.set()
-        if ok:
-            self._store_session(login_obj)
         return ok
-
-    # -- 会话 cookie 的进程内复用 -------------------------------------------- #
-
-    def _session_key(self) -> str:
-        return self._cache_key("session", self.host)
-
-    def _restore_session(self) -> None:
-        """复用上一次登录的会话 cookie；服务端失效时下一次 401 会自动重登。
-
-        进程内不做本地过期：cookie 的有效期由服务端决定（登录响应里的
-        expires_at，当前是一年后），本地提前作废只会白做一次登录。
-        """
-        try:
-            now = time.time()
-            with self._cache_lock:
-                hit = self._cache.get(self._session_key())
-            if not hit or hit[1] <= now:
-                return
-            cookie = _text(hit[0])
-            if not cookie:
-                return
-            for part in cookie.split(";"):
-                if "=" in part:
-                    name, value = part.split("=", 1)
-                    if name.strip():
-                        self._cookie_map[name.strip()] = value.strip()
-            self._auth_cookie = cookie
-            self._login_state = 1
-        except Exception:
-            pass
-
-    def _store_session(self, payload: Any = None) -> None:
-        """把会话 cookie 存入进程内缓存，有效期取服务端给的 expires_at。"""
-        try:
-            cookie = self._auth_cookie
-            if not cookie:
-                return
-            now = time.time()
-            expire = _epoch(_as_dict(payload).get("expires_at"))
-            if expire <= now:
-                # 服务端没给有效期：按进程生命周期一直复用
-                expire = now + _SESSION_FALLBACK_TTL
-            with self._cache_lock:
-                self._cache[self._session_key()] = (cookie, expire)
-        except Exception:
-            pass
-
-    def _invalidate_session(self) -> None:
-        try:
-            with self._cache_lock:
-                self._cache.pop(self._session_key(), None)
-            with self._login_lock:
-                self._cookie_map.clear()
-                self._auth_cookie = ""
-        except Exception:
-            pass
 
     @staticmethod
     def _cache_key(key: str, host: str) -> str:
@@ -1029,67 +630,18 @@ class _Http(object):
         sep = "&" if "?" in path else "?"
         return path + sep + urllib.parse.urlencode(items)
 
-    @staticmethod
-    def _exchange(conn: Any, method: str, path: str, headers: Dict[str, str],
-                  data: Any) -> Tuple[bytes, Any, int, bool]:
-        conn.request(method, path, body=data, headers=headers)
-        resp = conn.getresponse()
-        try:
-            raw = resp.read(8 * 1024 * 1024)
-            status = _int(getattr(resp, "status", 0), 0)
-            resp_headers = resp.headers
-            reusable = not getattr(resp, "will_close", True)
-        finally:
-            resp.close()
-        return raw, resp_headers, status, reusable
-
-    def _send_keepalive(self, method: str, path: str, headers: Dict[str, str],
-                        data: Any, timeout: float) -> Tuple[bytes, Any, int]:
-        """用复用的连接发一次请求，返回 (body, 响应头, 状态码)。
-
-        池里的旧连接被对端关掉时（CDN 空闲回收），立刻换一条新连接重试一次，
-        既不丢功能，也不用等一次失败往返。
-        """
-        conn, reused = self._keepalive.acquire(timeout)
-        reusable = False
-        try:
-            try:
-                raw, resp_headers, status, reusable = self._exchange(
-                    conn, method, path, headers, data)
-                return raw, resp_headers, status
-            except Exception:
-                if not reused:
-                    raise
-        finally:
-            self._keepalive.release(conn, reusable)
-        # 复用的旧连接已失效：换新连接再试一次
-        conn, _ = self._keepalive.acquire(timeout)
-        reusable = False
-        try:
-            raw, resp_headers, status, reusable = self._exchange(
-                conn, method, path, headers, data)
-            return raw, resp_headers, status
-        finally:
-            self._keepalive.release(conn, reusable)
-
     def request(self, method: str, path: str,
                 params: Optional[Dict[str, Any]] = None,
                 body: Any = None, signed: bool = True,
                 timeout: Optional[float] = None,
-                need_auth: bool = True,
-                retries: Optional[int] = None) -> Tuple[Dict[str, Any], int]:
-        """返回 (JSON 对象, HTTP 状态码)；任何失败返回 ({}, code 或 0)。
-
-        retries 传 0 表示这条请求不重试：首页/列表等对延迟敏感、且有缓存兜底的
-        路径都走这条，避免一次抖动把耗时翻倍。
-        """
+                need_auth: bool = True) -> Tuple[Dict[str, Any], int]:
+        """返回 (JSON 对象, HTTP 状态码)；任何失败返回 ({}, code 或 0)。"""
         if need_auth and signed:
             self.ensure_login()
         full_path = self._build_path(path, params)
         url = self.host + full_path
         method = (method or "GET").upper()
-        attempts = (self.retries if retries is None
-                    else max(0, min(3, _int(retries, 0)))) + 1
+        attempts = self.retries + 1
         status = 0
         for attempt in range(attempts):
             try:
@@ -1100,49 +652,15 @@ class _Http(object):
                 if body is not None:
                     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
                     headers["Content-Type"] = "application/json"
-                timeout_value = timeout or self.timeout
-                resp_headers = None
-                raw = b""
-                status = 0
+                req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                resp = self._opener.open(req, timeout=timeout or self.timeout)
                 try:
-                    if not self._pool_ok:
-                        raise _PoolSkip()
-                    try:
-                        raw, resp_headers, status = self._send_keepalive(
-                            method, full_path, headers, data, timeout_value)
-                    except Exception:
-                        # 连续两次复用/直连失败（通常是必须走代理），之后一律
-                        # 退回 urllib，避免每次都等一次超时
-                        self._pool_fails += 1
-                        if self._pool_fails >= 2:
-                            self._pool_ok = False
-                            self._keepalive.close_all()
-                        raise
-                    self._pool_fails = 0
-                    if status >= 400:
-                        # 交给下面的 HTTPError 分支统一处理（对齐时钟、重登、重试）
-                        raise urllib.error.HTTPError(
-                            url, status, "http %s" % status, resp_headers, None)
-                    if 300 <= status < 400:
-                        # 重定向交给 urllib 处理（签名按 path 计算，不能自行跟随）
-                        raise _PoolSkip()
-                except urllib.error.HTTPError:
-                    raise
-                except Exception:
-                    # 复用连接不可用（握手失败/连接已被对端关闭/重定向）：退回
-                    # urllib 重开连接，行为与未做复用前完全一致
-                    req = urllib.request.Request(url, data=data,
-                                                 headers=headers, method=method)
-                    resp = self._opener.open(req, timeout=timeout_value)
-                    try:
-                        status = (_int(getattr(resp, "status", 0), 0)
-                                  or _int(resp.getcode(), 0))
-                        resp_headers = resp.headers
-                        raw = resp.read(8 * 1024 * 1024)
-                    finally:
-                        resp.close()
-                self._apply_date(resp_headers)
-                self._absorb_cookies(resp_headers)
+                    status = _int(getattr(resp, "status", 0), 0) or _int(resp.getcode(), 0)
+                    self._apply_date(resp.headers)
+                    self._absorb_cookies(resp.headers)
+                    raw = resp.read(8 * 1024 * 1024)
+                finally:
+                    resp.close()
                 if not raw:
                     return {}, status or 204
                 obj = json.loads(raw.decode("utf-8", "replace"))
@@ -1156,8 +674,7 @@ class _Http(object):
                 if status == 401 and signed:
                     self._sync_clock()
                 if status in (401, 403) and signed and need_auth:
-                    # 会话可能已失效：丢弃缓存的 cookie 并重新登录后再重试
-                    self._invalidate_session()
+                    # 会话可能已失效：重置登录状态并重新登录后再重试
                     with self._login_lock:
                         self._login_state = 0
                         self._login_at = 0.0
@@ -1173,20 +690,15 @@ class _Http(object):
                 return {}, 0
         return {}, status
 
-    # -- 简单 TTL 缓存（只用于播放解析等非首页数据）------------------------- #
+    # -- 简单 TTL 缓存 ------------------------------------------------------- #
 
     def cached(self, key: str, ttl: float, producer) -> Any:
         now = time.time()
         cache_key = self._cache_key(key, self.host)
         with self._cache_lock:
             hit = self._cache.get(cache_key)
-        if hit and hit[1] > now:
-            return hit[0]
-        return self._fetch_cache(key, ttl, producer)
-
-    def _fetch_cache(self, key: str, ttl: float, producer) -> Any:
-        now = time.time()
-        cache_key = self._cache_key(key, self.host)
+            if hit and hit[1] > now:
+                return hit[0]
         try:
             value = producer()
         except Exception:
@@ -1194,13 +706,23 @@ class _Http(object):
         if value is None:
             value = {}
         # 空/失败结果只做极短缓存，避免故障期间长时间不可用
-        effective = ttl if value else min(ttl, 30.0)
+        effective = ttl if value else min(ttl, 8.0)
         with self._cache_lock:
             if len(self._cache) > 256:
                 for k in [k for k, v in self._cache.items() if v[1] <= now]:
                     self._cache.pop(k, None)
             self._cache[cache_key] = (value, now + effective)
         return value
+
+    def peek(self, key: str) -> Any:
+        """只读缓存，绝不发起网络请求（用于不能被网络阻塞的路径）。"""
+        now = time.time()
+        cache_key = self._cache_key(key, self.host)
+        with self._cache_lock:
+            hit = self._cache.get(cache_key)
+            if hit and hit[1] > now:
+                return hit[0]
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1216,8 +738,7 @@ class Spider(_BaseSpider):
         self._timeout = 12.0
         self._retries = 1
         self._page_size = 20
-        self._home_deadline = 3.0
-        self._home_timeout = 6.0
+        self._home_deadline = 4.0
         self._account = ""
         self._password = ""
         self._accounts = _ACCOUNT_POOL
@@ -1242,8 +763,6 @@ class Spider(_BaseSpider):
             "build_version": self._build_version,
             "timeout": self._timeout,
             "retries": self._retries,
-            "home_deadline": self._home_deadline,
-            "home_timeout": self._home_timeout,
             "account": self._account,
             "password": self._password,
             "accounts": self._accounts,
@@ -1277,35 +796,20 @@ class Spider(_BaseSpider):
         self._timeout = float(_text(ext.get("timeout"), "12") or "12")
         self._retries = _int(ext.get("retries"), 1)
         self._page_size = _positive(ext.get("page_size"), 20, 50)
-        # 首页现拉数据的最长等待时间：默认 3 秒，慢网可调大（1~15 秒）
-        try:
-            self._home_deadline = float(_text(ext.get("home_deadline"), "3") or "3")
-        except (TypeError, ValueError):
-            self._home_deadline = 3.0
-        self._home_deadline = max(1.0, min(15.0, self._home_deadline))
-        try:
-            self._home_timeout = float(_text(ext.get("home_timeout"), "") or "0")
-        except (TypeError, ValueError):
-            self._home_timeout = 0.0
-        if self._home_timeout <= 0:
-            self._home_timeout = min(self._timeout, 6.0)
-        self._home_timeout = max(2.0, min(self._timeout, self._home_timeout))
+        # 首页预热的最长等待时间：超时只影响首页影片列表，不影响分类/筛选
+        self._home_deadline = max(2.0, min(15.0, _positive(ext.get("home_deadline"), 4, 15) or 6.0))
         self._account = _text(ext.get("account") or ext.get("username"))
         self._password = _text(ext.get("password")) or self._account
         self._accounts = _normalize_accounts(ext.get("accounts")) or _ACCOUNT_POOL
         new_cfg = self._config_snapshot()
-        # 配置未变时复用既有会话，避免重复登录
+        # 配置未变时复用既有会话与已预热缓存，避免重复登录和重新拉取首页
         previous = getattr(self, "_cfg", None)
         if new_cfg == previous and getattr(self, "_http", None) is not None:
             self._cfg = new_cfg
             return ""
         self._cfg = new_cfg
         self._http = self._new_http()
-        # init 不登录、不等待网络：后台先备好会话与空闲连接。首页不缓存数据，
-        # 但连接是复用的，提前把 TCP+TLS 握手做掉，第一次进首页就能直接发请求。
-        _spawn_bg("login:" + self._host, self._http.ensure_login)
-        _spawn_bg("warm:" + self._host,
-                  lambda: self._http.warm_connections(2))
+        # init 同样不登录：登录在首个请求里按需完成，保证 init 立即返回
         return ""
 
     def getName(self) -> str:
@@ -1314,10 +818,16 @@ class Spider(_BaseSpider):
     # -- 配置 / 分类 / 筛选 -------------------------------------------------- #
 
     def _bootstrap(self) -> Dict[str, Any]:
-        """运行时配置（分类 / 筛选的定义）。首页每次进都重新取，不用缓存。"""
-        obj, _ = self._http.request("GET", "/v1/runtime/bootstrap", signed=False,
-                                    timeout=self._home_timeout, retries=0)
-        return _as_dict(obj)
+        def load():
+            obj, _ = self._http.request("GET", "/v1/runtime/bootstrap", signed=False)
+            return obj
+        return self._http.cached("runtime.bootstrap", 300.0, load)
+
+    def _bootstrap_view(self, allow_fetch: bool) -> Dict[str, Any]:
+        """取运行时配置：allow_fetch=True 走缓存/请求，False 时只读缓存不联网。"""
+        if allow_fetch:
+            return self._bootstrap()
+        return _as_dict(self._http.peek("runtime.bootstrap"))
 
     def _categories_from(self, boot: Dict[str, Any]) -> List[Dict[str, str]]:
         ui = _as_dict(_as_dict(boot).get("catalog_ui"))
@@ -1332,6 +842,26 @@ class Spider(_BaseSpider):
             out.append({"type_id": tid,
                         "type_name": _first(c.get("label"), tid)})
         return out
+
+    def _build_categories(self) -> List[Dict[str, str]]:
+        return self._categories_from(self._bootstrap())
+
+    def _categories(self, allow_fetch: bool = True) -> List[Dict[str, str]]:
+        """分类标签。allow_fetch=False 时只读缓存，绝不触发网络。"""
+        raw = (self._http.cached("categories", 300.0, self._build_categories)
+               if allow_fetch else self._categories_from(self._bootstrap_view(False)))
+        result = []
+        seen = set()
+        for item in _as_list(raw):
+            obj = _as_dict(item)
+            tid = _text(obj.get("type_id"))
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            result.append({"type_id": tid,
+                           "type_name": _first(obj.get("type_name"), tid)})
+        # 缓存没热起来时也必须给出完整的分类，播放端才不会出现"分类空白"
+        return result or [dict(x) for x in _FALLBACK_CATEGORIES]
 
     def _filters_from(self, boot: Dict[str, Any]) -> Dict[str, Any]:
         ui = _as_dict(_as_dict(boot).get("catalog_ui"))
@@ -1364,6 +894,21 @@ class Spider(_BaseSpider):
             if rows:
                 out[kind] = rows
         return out
+
+    def _build_filters(self) -> Dict[str, Any]:
+        return self._filters_from(self._bootstrap())
+
+    def _filters(self, allow_fetch: bool = True) -> Dict[str, Any]:
+        """筛选定义。allow_fetch=False 时只读缓存，绝不触发网络。"""
+        raw = (self._http.cached("filters", 300.0, self._build_filters)
+               if allow_fetch else self._filters_from(self._bootstrap_view(False)))
+        result = {}
+        if isinstance(raw, dict):
+            for kind, rows in raw.items():
+                cloned = _clone_filter_rows(rows)
+                if cloned:
+                    result[_text(kind)] = cloned
+        return result
 
     @staticmethod
     def _fill_filters(filters: Any, categories: List[Dict[str, str]]) -> Dict[str, Any]:
@@ -1454,197 +999,59 @@ class Spider(_BaseSpider):
     # -- 首页 ---------------------------------------------------------------- #
 
     def _home_feed(self) -> Dict[str, Any]:
-        """首页 feed：匿名即可取到，短超时、零重试。"""
-        params = {"scope": "public", "mode": "preview", "sections": 3, "cards": 10}
-        obj, _ = self._http.request("GET", "/v1/feed/home", dict(params),
-                                    need_auth=False,
-                                    timeout=self._home_timeout, retries=0)
-        if _as_list(_as_dict(obj).get("sections")):
-            return _as_dict(obj)
-        # 站点将来若收紧成必须登录：补一次会话再试
-        if self._http.ensure_login():
-            obj, _ = self._http.request("GET", "/v1/feed/home", dict(params),
-                                        timeout=self._home_timeout, retries=0)
-        return _as_dict(obj)
+        def load():
+            obj, _ = self._http.request("GET", "/v1/feed/home", {
+                "scope": "public", "mode": "preview", "sections": 3, "cards": 10,
+            })
+            return obj
+        result = self._http.cached("home.feed", 300.0, load)
+        return result if isinstance(result, dict) else {}
 
-    def _vods_from_feed(self, feed: Any) -> List[Dict[str, Any]]:
+    def _home_vods(self, allow_fetch: bool = True) -> List[Dict[str, Any]]:
+        feed = (self._home_feed() if allow_fetch
+                else _as_dict(self._http.peek("home.feed")))
         cards = []
-        for section in _as_list(_as_dict(feed).get("sections")):
+        for section in _as_list(feed.get("sections")):
             cards.extend(_as_list(_as_dict(section).get("cards")))
         return self._cards_to_vods(cards)
 
-    def _fetch_home_pair(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """bootstrap 与 feed 并行现拉，最多等 home_deadline。"""
+    def homeContent(self, filter: Any = False) -> Dict[str, Any]:
+        # 参考实现的思路：分类与筛选是纯本地数据，绝不依赖网络是否成功。
+        # 这里先并行预热（有硬上限），随后只读缓存组装；登录/站点慢或不可达时
+        # 依然能立刻返回分类标签 + 筛选条件，播放端不会出现"分类空白"。
         pool = ThreadPoolExecutor(max_workers=2)
         try:
-            f_boot = pool.submit(self._bootstrap)
-            f_feed = pool.submit(self._home_feed)
-            wait([f_boot, f_feed], timeout=self._home_deadline)
-            if not (f_boot.done() and f_feed.done()):
-                # 预算内没齐（冷启动要付两次 TCP+TLS 握手就会这样）：再等余下
-                # 预算，宁可慢一点也不能给用户一个空的首页
-                wait([f_boot, f_feed],
-                     timeout=max(0.0, self._home_timeout - self._home_deadline))
-
-            def _value(fut: Any) -> Dict[str, Any]:
-                try:
-                    return _as_dict(fut.result()) if fut.done() else {}
-                except Exception:
-                    return {}
-
-            boot, feed = _value(f_boot), _value(f_feed)
+            boot = pool.submit(self._bootstrap)
+            feed = pool.submit(self._home_feed)
+            try:
+                boot.result(timeout=self._home_deadline)
+                feed.result(timeout=self._home_deadline)
+            except Exception:
+                pass
         finally:
             pool.shutdown(wait=False)
-        return boot, feed
-
-    # -- 首页文件缓存 -------------------------------------------------------- #
-
-    def _home_payload(self, boot: Dict[str, Any], feed: Any) -> Dict[str, Any]:
-        """把 bootstrap + feed 组装成 homeContent 的返回值（也是落盘的内容）。"""
-        classes = (self._categories_from(boot)
-                   or [dict(x) for x in _FALLBACK_CATEGORIES])
-        return {
-            "class": classes,
-            "filters": self._fill_filters(self._filters_from(boot), classes),
-            "list": self._vods_from_feed(feed),
-            "ts": time.time(),
-        }
-
-    @property
-    def _host_key(self) -> str:
-        """缓存里认站点用：去掉首尾空白与结尾斜杠、忽略大小写，避免配置写法不同就失效。"""
-        return _text(self._host).strip().rstrip("/").lower()
-
-    def _home_snapshot(self) -> Dict[str, Any]:
-        snap = _file_read(_cache_file("home"), _HOME_FILE_MAX_AGE)
-        # 文件名不带 host，就靠文件里的 host 字段认：换站点后的旧数据不认
-        if _text(snap.get("host")) != self._host_key:
-            return {}
-        if _as_list(snap.get("class")) and _as_list(snap.get("list")):
-            return snap
-        return {}
-
-    def _store_home(self, payload: Dict[str, Any]) -> None:
-        # 空结果不落盘：宁可继续用旧文件，也不要把"拉挂了"写成缓存
-        if _as_list(payload.get("list")):
-            _file_write(_cache_file("home"), dict(payload, host=self._host_key))
-
-    def _refresh_home_bg(self) -> None:
-        """后台把首页重拉一遍并覆盖缓存文件，用户不等这一次网络。"""
-        global _HOME_REFRESH_AT
-        path = _cache_file("home")
-        if not path:
-            return
-        with _DISK_LOCK:
-            if time.time() - _HOME_REFRESH_AT < _HOME_REFRESH_MIN_GAP:
-                return
-            _HOME_REFRESH_AT = time.time()
-
-        def work() -> None:
-            try:
-                boot, feed = self._fetch_home_pair()
-                self._store_home(self._home_payload(boot, feed))
-            except Exception:
-                pass
-
-        _spawn_bg("home", work)
-
-    def homeContent(self, filter: Any = False) -> Dict[str, Any]:
-        started = time.time()
-        snap = self._home_snapshot()
-        if snap:
-            # 有文件缓存：立即按缓存返回，后台同时刷新，下次进首页就是新数据
-            self._refresh_home_bg()
-            result = {
-                "class": _as_list(snap.get("class")),
-                "filters": _as_dict(snap.get("filters")),
-                "list": _as_list(snap.get("list")),
+        classes = self._categories(allow_fetch=False)
+        try:
+            return {
+                "class": classes,
+                "filters": self._fill_filters(self._filters(allow_fetch=False), classes),
+                "list": self._home_vods(allow_fetch=False),
             }
-            _diag_write("home", {
-                "ms": int((time.time() - started) * 1000), "hit": True,
-                "class": len(result["class"]), "list": len(result["list"]),
-                "dir": _cache_dir(),
-            })
-            return result
-        try:
-            boot, feed = self._fetch_home_pair()
         except Exception:
-            boot, feed = {}, {}
-        try:
-            payload = self._home_payload(boot, feed)
-        except Exception:
-            classes = [dict(x) for x in _FALLBACK_CATEGORIES]
-            payload = {"class": classes, "filters": {},
-                       "list": [], "ts": time.time()}
-        self._store_home(payload)
-        raw = _file_read(_cache_file("home"), 0.0)
-        _diag_write("home", {
-            "ms": int((time.time() - started) * 1000), "hit": False,
-            "class": len(payload.get("class") or []),
-            "list": len(payload.get("list") or []), "dir": _cache_dir(),
-            # 命中失败时把两边的 host 都记下来，方便判断是"没拉成功"还是"host 对不上"
-            "host": self._host_key, "file_host": _text(raw.get("host")),
-            "file_ts": raw.get("ts"),
-        })
-        return {"class": payload["class"], "filters": payload["filters"],
-                "list": payload["list"]}
-
-    def _load_home_video(self) -> List[Dict[str, Any]]:
-        vods, _ = self._browse(
-            {"page": 1, "limit": self._page_size, "sort": "updated_desc"},
-            timeout=self._home_timeout, retries=0,
-        )
-        return vods
-
-    def _store_home_video(self, vods: Any) -> None:
-        """更新榜落盘：每次调用都写（便于在手机上确认接口有没有被调到）。
-
-        拉到空结果时保留上一次的好数据，不让一次失败把缓存清成空的。
-        """
-        path = _cache_file("homevideo")
-        items = _as_list(vods)
-        previous = _as_list(_file_read(path, _HOME_FILE_MAX_AGE).get("list"))
-        _file_write(path, {
-            "list": items or previous,
-            "ts": time.time(),
-            "host": self._host_key,
-            "ok": bool(items),
-            "note": "ok" if items else "empty",
-        })
+            return {"class": classes,
+                    "filters": self._fill_filters({}, classes),
+                    "list": []}
 
     def homeVideoContent(self) -> Dict[str, Any]:
-        """首页影片列表：有缓存秒出；没有视频缓存时先用首页那份顶上，不等网络。"""
-        started = time.time()
-        snap = _file_read(_cache_file("homevideo"), _HOME_FILE_MAX_AGE)
-        cached = (_as_list(snap.get("list"))
-                  if _text(snap.get("host")) == self._host_key else [])
-
-        def refresh() -> None:
-            try:
-                self._store_home_video(self._load_home_video())
-            except Exception:
-                pass
-
-        if cached:
-            _spawn_bg("homevideo", refresh)
-            source, items = "cache", cached
-        else:
-            # 没有视频缓存：先用首页那份（同样是卡片转出来的列表）立即顶上，
-            # 不为这一栏把首页等满 home_timeout；后台再拉专用更新榜覆盖。
-            items = _as_list(self._home_snapshot().get("list"))[:self._page_size]
-            if items:
-                source = "home"
-                _spawn_bg("homevideo", refresh)
-            else:
-                source = "net"
-                try:
-                    items = _as_list(self._load_home_video())
-                except Exception:
-                    items = []
-                self._store_home_video(items)
-        _diag_write("video", {"ms": int((time.time() - started) * 1000),
-                              "src": source, "list": len(items)})
-        return {"list": items}
+        try:
+            vods, _ = self._browse({
+                "page": 1, "limit": self._page_size, "sort": "updated_desc",
+            })
+            if not vods:
+                vods = self._home_vods()
+            return {"list": vods}
+        except Exception:
+            return {"list": []}
 
     # -- 最近更新 ---------------------------------------------- #
 
@@ -1817,19 +1224,14 @@ class Spider(_BaseSpider):
 
     # -- 列表 / 分类 / 搜索 -------------------------------------------------- #
 
-    def _browse(self, params: Dict[str, Any],
-                timeout: Optional[float] = None,
-                retries: Optional[int] = None
-                ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        obj, _ = self._http.request("GET", "/v1/browse/catalog", params,
-                                    timeout=timeout, retries=retries)
+    def _browse(self, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        obj, _ = self._http.request("GET", "/v1/browse/catalog", params)
         # 异常响应（410 候选集失效 / 数据源失败）时退化为不带附加标记的纯查询
         if not _as_list(obj.get("cards")) and _text(obj.get("status")) == "410":
             retry = dict(params)
             for key in ("candidate_set_ref", "continue_search"):
                 retry.pop(key, None)
-            obj, _ = self._http.request("GET", "/v1/browse/catalog", retry,
-                                        timeout=timeout, retries=retries)
+            obj, _ = self._http.request("GET", "/v1/browse/catalog", retry)
         return self._cards_to_vods(obj.get("cards")), _as_dict(obj.get("pagination"))
 
     def _page_result(self, vods: List[Dict[str, Any]],
@@ -2343,14 +1745,9 @@ if __name__ == "__main__":
     try:
         instance = Spider()
         probe = instance.homeContent(False)
-        # 首页能出分类和卡片就算可用；卡片没赶上就退而要求登录成功（证明站点可达）。
-        # 现在首页本身不依赖登录，所以不再把“登录成功”当成唯一判据。
-        has_cards = (isinstance(probe, dict)
-                     and isinstance(probe.get("class"), list)
-                     and bool(probe.get("class"))
-                     and isinstance(probe.get("list"), list)
-                     and bool(probe.get("list")))
-        ok = has_cards or instance._http.ensure_login()
+        ok = isinstance(probe, dict) and isinstance(probe.get("list"), list) \
+            and isinstance(probe.get("class"), list) and bool(probe.get("class")) \
+            and instance._http.ensure_login()
         sys.exit(0 if ok else 1)
     except Exception:
         sys.exit(1)
