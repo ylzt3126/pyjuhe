@@ -57,14 +57,14 @@ TVBox 每页条数一致（默认 20），因此一页对应一次请求，用 n
 
 首页加载加速
 ------------
-1. 首页文件缓存：第一次拉到内容后，把分类/筛选/海报落一份 JSON 文件
-   （dongpian_home.json / dongpian_homevideo.json，放在应用缓存目录）。Android
-   上直接向 Java 侧要目录（Chaquopy 的 Python.getPlatform()->getApplication()
-   ->getCacheDir()），不猜路径；取不到则退到 Chaquopy 官方写文件位置
-   os.environ["HOME"]（应用私有存储）。之后每次进首页先直接读文件、立即返回，
-   同时起后台任务重新拉 bootstrap+feed 并覆盖文件——所以看到的是"上次拉到的最新"，
-   而下一次进首页拿到的又是更新的。播放端重启、py 模块重新下载都照样命中（缓存不
-   依赖模块路径）。文件超过一周、host 对不上、或结构不对，视为没有缓存，走同步拉取。
+1. 首页文件缓存：第一次拉到内容后，把分类/筛选/海报落一份 JSON 文件，位置固定为
+   Android 公共下载目录 /storage/emulated/0/Download（dongpian_home.json、
+   dongpian_homevideo.json；目录不存在就先创建，不再尝试任何其它目录；桌面本地
+   跑则放在 py 所在目录）。之后每次进首页先直接读文件、立即返回，同时起后台任务
+   重新拉 bootstrap+feed 并覆盖文件——所以看到的是"上次拉到的最新"，而下一次进
+   首页拿到的又是更新的。播放端重启、py 模块重新下载都照样命中（缓存不依赖模块
+   路径）。该目录不可写时就不缓存（功能照常）。文件超过一周、host 对不上、或结构
+   不对，视为没有缓存，走同步拉取。
 2. homeContent 把 bootstrap 与 feed 两个请求并行发出，只等这两项（上限
    home_deadline，默认 3 秒）；不做「先登录、再取数据」的串行流程。
 3. 登录不在首页路径上：feed 匿名即可取到，登录交给后台，只为详情/播放提前
@@ -184,9 +184,9 @@ def _spawn_bg(name: str, fn: Any) -> None:
 # 播放端每次打开都会重建 py 模块（py 用 gitee 链接在线加载时更容易如此），
 # 进程内缓存跟着清空，所以首页内容额外落一份 JSON 文件：有文件就先读文件秒出，
 # 同时后台重新拉一遍覆盖，下次进首页即最新。
-# 文件名固定为 dongpian_home.json / dongpian_homevideo.json，放在"应用缓存目录"：
-# Android 上直接向 Java 侧要 cache 目录（Chaquopy 的 Python.getPlatform()），
-# 不猜路径；桌面/本地 py 则用 py 所在目录。
+# 位置固定为 Android 公共下载目录 /storage/emulated/0/Download（不存在就先创建），
+# 不再去试任何其它目录；桌面本地跑则放在 py 所在目录。
+_CACHE_FIXED = "/storage/emulated/0/Download"
 _CACHE_PREFIX = "dongpian"
 _HOME_FILE_MAX_AGE = 7 * 86400.0   # 文件超过一周视为无效（站点结构可能已变）
 _HOME_REFRESH_MIN_GAP = 20.0      # 两次后台刷新之间的最小间隔（防重进首页抖动）
@@ -196,70 +196,42 @@ _DISK_LOCK = threading.RLock()
 _HOME_REFRESH_AT = 0.0
 
 
-def _android_app_dir() -> str:
-    """Android 上直接问应用要目录，不做逐层猜测。
-
-    1. Chaquopy 的 Java 桥：Python.getPlatform().getApplication() 就是本应用，
-       getCacheDir() 即应用缓存目录（FongMi 系 TVBox 的 py 就跑在 Chaquopy 里）。
-    2. 拿不到就用 Chaquopy 官方在 Android 上写文件的推荐位置 HOME（应用私有存储）。
-    3. python-for-android 打包的则看 ANDROID_PRIVATE。
-    非 Android 一律返回空串。
-    """
-    try:
-        from com.chaquo.python import Python as _jpy
-        folder = str(_jpy.getPlatform().getApplication()
-                     .getCacheDir().getAbsolutePath())
-        if folder:
-            return folder
-    except Exception:
-        pass                      # 不是 Chaquopy 环境 / 桥不可用，继续往下
-    for key in ("HOME", "ANDROID_PRIVATE"):
-        value = os.environ.get(key) or ""
-        if value.startswith("/data/"):
-            return value
-    return ""
+def _is_android() -> bool:
+    """Android 进程一定带 ANDROID_DATA 环境变量，桌面系统没有。"""
+    return bool(os.environ.get("ANDROID_DATA"))
 
 
-def _cache_candidates() -> List[str]:
-    """候选目录：Android 应用目录 → py 所在目录 → 工作目录 → 桌面系统缓存目录。"""
-    dirs = []                    # type: List[str]
-    app_dir = _android_app_dir()
-    if app_dir:
-        dirs.append(app_dir)
+def _local_dir() -> str:
+    """桌面本地跑 py 时的缓存目录：py 所在目录（在线加载没有 __file__ 时用工作目录）。"""
     try:
-        # 本地加载 py 时 __file__ 存在；在线加载（exec 注入源码）时不存在
-        dirs.append(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.dirname(os.path.abspath(__file__))
     except Exception:
-        pass
-    try:
-        dirs.append(os.getcwd())
-    except Exception:
-        pass
-    for key in ("XDG_CACHE_HOME", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP"):
-        value = os.environ.get(key) or ""
-        if value:
-            dirs.append(value)
-    return [d for d in dirs if d]
+        try:
+            return os.getcwd()
+        except Exception:
+            return ""
 
 
 def _cache_dir() -> str:
-    """选第一个真正可写的目录；全都不行就返回空串（不缓存，功能照常）。"""
+    """只有一个位置：Android 固定 /storage/emulated/0/Download，桌面用 py 所在目录。
+
+    目录不存在就先创建；不可写则返回空串（不缓存，功能照常），不退回其它目录。
+    """
     global _CACHE_DIR
     with _CACHE_DIR_LOCK:
         if _CACHE_DIR:
             return _CACHE_DIR
-        for base in _cache_candidates():
-            try:
-                if not os.path.isdir(base):
-                    continue
-                probe = os.path.join(base, "." + _CACHE_PREFIX + ".probe")
-                with open(probe, "w", encoding="utf-8") as fh:
-                    fh.write("1")
-                os.remove(probe)
-                _CACHE_DIR = base
-                break
-            except Exception:
-                continue
+        path = _CACHE_FIXED if _is_android() else _local_dir()
+        try:
+            if not os.path.isdir(path):
+                os.makedirs(path)
+            probe = os.path.join(path, "." + _CACHE_PREFIX + ".probe")
+            with open(probe, "w", encoding="utf-8") as fh:
+                fh.write("1")
+            os.remove(probe)
+            _CACHE_DIR = path
+        except Exception:
+            _CACHE_DIR = ""
         return _CACHE_DIR
 
 
