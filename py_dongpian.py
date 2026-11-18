@@ -57,17 +57,23 @@ TVBox 每页条数一致（默认 20），因此一页对应一次请求，用 n
 
 首页加载加速
 ------------
-1. 首页不用缓存：每次进首页都重新取一遍（分类/筛选来自 bootstrap，海报来自
-   feed），保证看到的就是当下数据。
+1. 首页文件缓存：第一次拉到内容后，把分类/筛选/海报落一份 JSON 文件
+   （dongpian_home.json / dongpian_homevideo.json，放在应用缓存目录）。Android
+   上直接向 Java 侧要目录（Chaquopy 的 Python.getPlatform()->getApplication()
+   ->getCacheDir()），不猜路径；取不到则退到 Chaquopy 官方写文件位置
+   os.environ["HOME"]（应用私有存储）。之后每次进首页先直接读文件、立即返回，
+   同时起后台任务重新拉 bootstrap+feed 并覆盖文件——所以看到的是"上次拉到的最新"，
+   而下一次进首页拿到的又是更新的。播放端重启、py 模块重新下载都照样命中（缓存不
+   依赖模块路径）。文件超过一周、host 对不上、或结构不对，视为没有缓存，走同步拉取。
 2. homeContent 把 bootstrap 与 feed 两个请求并行发出，只等这两项（上限
    home_deadline，默认 3 秒）；不做「先登录、再取数据」的串行流程。
 3. 登录不在首页路径上：feed 匿名即可取到，登录交给后台，只为详情/播放提前
    备好会话。
 4. 真正的提速来源是连接复用（_KeepAlivePool）：省掉每个请求一次 TCP+TLS
    握手（实测这个站点单次握手就要 0.5~2 秒）。
-5. homeVideoContent 同样每次现拉更新榜，短超时、零重试。
+5. homeVideoContent 同样先读文件缓存、后台刷新更新榜。
 
-其余接口（播放解析结果、登录会话）仍有进程内 TTL 缓存，但首页不参与。
+其余接口（播放解析结果、登录会话）仍有进程内 TTL 缓存，首页走磁盘文件缓存。
 """
 
 import calendar
@@ -172,6 +178,141 @@ def _spawn_bg(name: str, fn: Any) -> None:
     except Exception:
         with _BG_LOCK:
             _BG_TASKS.pop(name, None)
+
+
+# ---- 首页文件缓存 ---------------------------------------------------------- #
+# 播放端每次打开都会重建 py 模块（py 用 gitee 链接在线加载时更容易如此），
+# 进程内缓存跟着清空，所以首页内容额外落一份 JSON 文件：有文件就先读文件秒出，
+# 同时后台重新拉一遍覆盖，下次进首页即最新。
+# 文件名固定为 dongpian_home.json / dongpian_homevideo.json，放在"应用缓存目录"：
+# Android 上直接向 Java 侧要 cache 目录（Chaquopy 的 Python.getPlatform()），
+# 不猜路径；桌面/本地 py 则用 py 所在目录。
+_CACHE_PREFIX = "dongpian"
+_HOME_FILE_MAX_AGE = 7 * 86400.0   # 文件超过一周视为无效（站点结构可能已变）
+_HOME_REFRESH_MIN_GAP = 20.0      # 两次后台刷新之间的最小间隔（防重进首页抖动）
+_CACHE_DIR = ""
+_CACHE_DIR_LOCK = threading.RLock()
+_DISK_LOCK = threading.RLock()
+_HOME_REFRESH_AT = 0.0
+
+
+def _android_app_dir() -> str:
+    """Android 上直接问应用要目录，不做逐层猜测。
+
+    1. Chaquopy 的 Java 桥：Python.getPlatform().getApplication() 就是本应用，
+       getCacheDir() 即应用缓存目录（FongMi 系 TVBox 的 py 就跑在 Chaquopy 里）。
+    2. 拿不到就用 Chaquopy 官方在 Android 上写文件的推荐位置 HOME（应用私有存储）。
+    3. python-for-android 打包的则看 ANDROID_PRIVATE。
+    非 Android 一律返回空串。
+    """
+    try:
+        from com.chaquo.python import Python as _jpy
+        folder = str(_jpy.getPlatform().getApplication()
+                     .getCacheDir().getAbsolutePath())
+        if folder:
+            return folder
+    except Exception:
+        pass                      # 不是 Chaquopy 环境 / 桥不可用，继续往下
+    for key in ("HOME", "ANDROID_PRIVATE"):
+        value = os.environ.get(key) or ""
+        if value.startswith("/data/"):
+            return value
+    return ""
+
+
+def _cache_candidates() -> List[str]:
+    """候选目录：Android 应用目录 → py 所在目录 → 工作目录 → 桌面系统缓存目录。"""
+    dirs = []                    # type: List[str]
+    app_dir = _android_app_dir()
+    if app_dir:
+        dirs.append(app_dir)
+    try:
+        # 本地加载 py 时 __file__ 存在；在线加载（exec 注入源码）时不存在
+        dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    try:
+        dirs.append(os.getcwd())
+    except Exception:
+        pass
+    for key in ("XDG_CACHE_HOME", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP"):
+        value = os.environ.get(key) or ""
+        if value:
+            dirs.append(value)
+    return [d for d in dirs if d]
+
+
+def _cache_dir() -> str:
+    """选第一个真正可写的目录；全都不行就返回空串（不缓存，功能照常）。"""
+    global _CACHE_DIR
+    with _CACHE_DIR_LOCK:
+        if _CACHE_DIR:
+            return _CACHE_DIR
+        for base in _cache_candidates():
+            try:
+                if not os.path.isdir(base):
+                    continue
+                probe = os.path.join(base, "." + _CACHE_PREFIX + ".probe")
+                with open(probe, "w", encoding="utf-8") as fh:
+                    fh.write("1")
+                os.remove(probe)
+                _CACHE_DIR = base
+                break
+            except Exception:
+                continue
+        return _CACHE_DIR
+
+
+def _cache_file(name: str) -> str:
+    """缓存文件路径：<应用缓存目录>/dongpian_<name>.json；目录不可用时返回空串。"""
+    folder = _cache_dir()
+    if not folder:
+        return ""
+    return os.path.join(folder, "%s_%s.json" % (_CACHE_PREFIX, name))
+
+
+def _cleanup_tmp(path: str) -> None:
+    """进程在写盘中途被杀会留下 .tmp，下次读这个文件时顺手清掉（超过 1 分钟的）。"""
+    try:
+        tmp = path + ".tmp"
+        if os.path.exists(tmp) and time.time() - os.stat(tmp).st_mtime > 60:
+            os.remove(tmp)
+    except Exception:
+        pass
+
+
+def _file_read(path: str, max_age: float = 0.0) -> Dict[str, Any]:
+    """读缓存文件；不存在 / 结构不对 / 太旧一律当成没有。"""
+    if not path:
+        return {}
+    try:
+        with _DISK_LOCK:
+            if max_age > 0 and time.time() - os.stat(path).st_mtime > max_age:
+                return {}
+            with open(path, "r", encoding="utf-8") as fh:
+                obj = json.load(fh)
+        _cleanup_tmp(path)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        _cleanup_tmp(path)
+        return {}
+
+
+def _file_write(path: str, obj: Dict[str, Any]) -> None:
+    """原子写：先写临时文件再改名，读的一方永远看不到半个文件。"""
+    if not path:
+        return
+    tmp = path + ".tmp"
+    try:
+        with _DISK_LOCK:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(obj, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
 
 _KIND_LABELS = {
     "movie": "电影",
@@ -1346,10 +1487,7 @@ class Spider(_BaseSpider):
         return self._cards_to_vods(cards)
 
     def _fetch_home_pair(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """bootstrap 与 feed 并行现拉，最多等 home_deadline。
-
-        首页不走缓存：每次进首页都重新取一遍，保证看到的就是当下数据。
-        """
+        """bootstrap 与 feed 并行现拉，最多等 home_deadline。"""
         pool = ThreadPoolExecutor(max_workers=2)
         try:
             f_boot = pool.submit(self._bootstrap)
@@ -1372,20 +1510,76 @@ class Spider(_BaseSpider):
             pool.shutdown(wait=False)
         return boot, feed
 
-    def homeContent(self, filter: Any = False) -> Dict[str, Any]:
-        boot, feed = self._fetch_home_pair()
+    # -- 首页文件缓存 -------------------------------------------------------- #
+
+    def _home_payload(self, boot: Dict[str, Any], feed: Any) -> Dict[str, Any]:
+        """把 bootstrap + feed 组装成 homeContent 的返回值（也是落盘的内容）。"""
         classes = (self._categories_from(boot)
                    or [dict(x) for x in _FALLBACK_CATEGORIES])
-        try:
+        return {
+            "class": classes,
+            "filters": self._fill_filters(self._filters_from(boot), classes),
+            "list": self._vods_from_feed(feed),
+            "ts": time.time(),
+        }
+
+    def _home_snapshot(self) -> Dict[str, Any]:
+        snap = _file_read(_cache_file("home"), _HOME_FILE_MAX_AGE)
+        # 文件名不带 host，就靠文件里的 host 字段认：换站点后的旧数据不认
+        if _text(snap.get("host")) != self._host:
+            return {}
+        if _as_list(snap.get("class")) and _as_list(snap.get("list")):
+            return snap
+        return {}
+
+    def _store_home(self, payload: Dict[str, Any]) -> None:
+        # 空结果不落盘：宁可继续用旧文件，也不要把"拉挂了"写成缓存
+        if _as_list(payload.get("list")):
+            _file_write(_cache_file("home"), dict(payload, host=self._host))
+
+    def _refresh_home_bg(self) -> None:
+        """后台把首页重拉一遍并覆盖缓存文件，用户不等这一次网络。"""
+        global _HOME_REFRESH_AT
+        path = _cache_file("home")
+        if not path:
+            return
+        with _DISK_LOCK:
+            if time.time() - _HOME_REFRESH_AT < _HOME_REFRESH_MIN_GAP:
+                return
+            _HOME_REFRESH_AT = time.time()
+
+        def work() -> None:
+            try:
+                boot, feed = self._fetch_home_pair()
+                self._store_home(self._home_payload(boot, feed))
+            except Exception:
+                pass
+
+        _spawn_bg("home", work)
+
+    def homeContent(self, filter: Any = False) -> Dict[str, Any]:
+        snap = self._home_snapshot()
+        if snap:
+            # 有文件缓存：立即按缓存返回，后台同时刷新，下次进首页就是新数据
+            self._refresh_home_bg()
             return {
-                "class": classes,
-                "filters": self._fill_filters(self._filters_from(boot), classes),
-                "list": self._vods_from_feed(feed),
+                "class": _as_list(snap.get("class")),
+                "filters": _as_dict(snap.get("filters")),
+                "list": _as_list(snap.get("list")),
             }
+        try:
+            boot, feed = self._fetch_home_pair()
         except Exception:
-            return {"class": classes,
-                    "filters": self._fill_filters({}, classes),
-                    "list": []}
+            boot, feed = {}, {}
+        try:
+            payload = self._home_payload(boot, feed)
+        except Exception:
+            classes = [dict(x) for x in _FALLBACK_CATEGORIES]
+            payload = {"class": classes, "filters": {},
+                       "list": [], "ts": time.time()}
+        self._store_home(payload)
+        return {"class": payload["class"], "filters": payload["filters"],
+                "list": payload["list"]}
 
     def _load_home_video(self) -> List[Dict[str, Any]]:
         vods, _ = self._browse(
@@ -1394,12 +1588,31 @@ class Spider(_BaseSpider):
         )
         return vods
 
+    def _store_home_video(self, vods: Any) -> None:
+        items = _as_list(vods)
+        if items:
+            _file_write(_cache_file("homevideo"),
+                        {"list": items, "ts": time.time(), "host": self._host})
+
     def homeVideoContent(self) -> Dict[str, Any]:
-        """首页影片列表：同样不缓存，每次取最新的更新榜。"""
+        """首页影片列表：先读文件缓存秒出，后台刷新更新榜。"""
+        snap = _file_read(_cache_file("homevideo"), _HOME_FILE_MAX_AGE)
+        cached = (_as_list(snap.get("list"))
+                  if _text(snap.get("host")) == self._host else [])
+        if cached:
+            def work() -> None:
+                try:
+                    self._store_home_video(self._load_home_video())
+                except Exception:
+                    pass
+            _spawn_bg("homevideo", work)
+            return {"list": cached}
         try:
-            return {"list": _as_list(self._load_home_video())}
+            vods = _as_list(self._load_home_video())
         except Exception:
-            return {"list": []}
+            vods = []
+        self._store_home_video(vods)
+        return {"list": vods}
 
     # -- 最近更新 ---------------------------------------------- #
 
