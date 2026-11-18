@@ -65,7 +65,9 @@ TVBox 每页条数一致（默认 20），因此一页对应一次请求，用 n
 3. 登录不在首页路径上：feed 匿名即可取到，登录交给后台，只为详情/播放提前
    备好会话。
 4. 真正的提速来源是连接复用（_KeepAlivePool）：省掉每个请求一次 TCP+TLS
-   握手（实测这个站点单次握手就要 0.5~2 秒）。
+   握手（实测这个站点单次握手就要 0.5~2 秒）。连接池是进程内共享的
+   （_shared_pool），模块级单例与播放端新建的实例共用同一套空闲连接，
+   预热只做一次；init 的预热与后台登录不会被"配置未变"的早退分支跳过。
 5. homeVideoContent 同样每次现拉更新榜，短超时、零重试，并且匿名取（不等
    登录）：播放端是 homeContent → homeVideoContent 串行调用，走鉴权会让冷
    启动先付一次登录预算（实测 2.41 秒 → 1.4 秒左右）；登录只留给详情/播放。
@@ -587,6 +589,31 @@ class _KeepAlivePool(object):
                 self._close(self._idle.pop()[0])
 
 
+# 进程内共享的连接池：所有 _Http 实例共用同一份。
+# 同一进程里往往不止一个 Spider（模块级单例 + 播放端自己 new 的），各自持
+# 一套池的话，预热做在其中一套里、请求却走另一套，等于白握手。共享之后
+# 预热一次所有实例都能直接复用。切 host 时整池丢弃重建，避免把 A 域名的
+# 连接发给 B 域名的请求（host 切换只在改配置时发生，丢弃可接受）。
+_SHARED_POOL = None            # type: Optional[_KeepAlivePool]
+_SHARED_POOL_ORIGIN = ""
+_SHARED_POOL_LOCK = threading.RLock()
+
+
+def _shared_pool(origin: str, timeout: float) -> _KeepAlivePool:
+    global _SHARED_POOL, _SHARED_POOL_ORIGIN
+    origin = (origin or "").rstrip("/")
+    with _SHARED_POOL_LOCK:
+        pool = _SHARED_POOL
+        if pool is not None and _SHARED_POOL_ORIGIN == origin:
+            return pool
+        if pool is not None:
+            pool.close_all()
+        pool = _KeepAlivePool(origin, timeout)
+        _SHARED_POOL = pool
+        _SHARED_POOL_ORIGIN = origin
+        return pool
+
+
 # --------------------------------------------------------------------------- #
 # 签名 HTTP 客户端
 # --------------------------------------------------------------------------- #
@@ -629,7 +656,8 @@ class _Http(object):
                 break
         self._pool_ok = not env_proxy
         self._pool_fails = 0
-        self._keepalive = _KeepAlivePool(self.host, self.timeout)
+        # 连接池进程内共享：预热一次，模块级单例与播放端新建的实例都能复用
+        self._keepalive = _shared_pool(self.host, self.timeout)
         self._clock_offset = 0.0
         self._lock = threading.RLock()
         self._cache = _SHARED_CACHE
@@ -1171,11 +1199,15 @@ class Spider(_BaseSpider):
         previous = getattr(self, "_cfg", None)
         if new_cfg == previous and getattr(self, "_http", None) is not None:
             self._cfg = new_cfg
-            return ""
-        self._cfg = new_cfg
-        self._http = self._new_http()
+        else:
+            self._cfg = new_cfg
+            self._http = self._new_http()
         # init 不登录、不等待网络：后台先备好会话与空闲连接。首页不缓存数据，
         # 但连接是复用的，提前把 TCP+TLS 握手做掉，第一次进首页就能直接发请求。
+        # 注意这两步放在早退分支之外：配置没变时也要预热，否则播放端传进来的
+        # extend 与内置默认一致（最常见的情况）就永远不预热，首屏每次都要
+        # 现付一次握手，还可能因为赶不上 home_deadline 而拿到空列表。
+        # _spawn_bg 按名字去重，重复 init 不会叠加线程；登录本身是幂等的。
         _spawn_bg("login:" + self._host, self._http.ensure_login)
         _spawn_bg("warm:" + self._host,
                   lambda: self._http.warm_connections(2))
