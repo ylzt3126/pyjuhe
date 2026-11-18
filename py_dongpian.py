@@ -194,6 +194,7 @@ _CACHE_DIR = ""
 _CACHE_DIR_LOCK = threading.RLock()
 _DISK_LOCK = threading.RLock()
 _HOME_REFRESH_AT = 0.0
+_MODULE_TS = time.time()          # 模块加载时刻（诊断用：判断慢在加载还是在请求）
 
 
 def _is_android() -> bool:
@@ -236,11 +237,25 @@ def _cache_dir() -> str:
 
 
 def _cache_file(name: str) -> str:
-    """缓存文件路径：<应用缓存目录>/dongpian_<name>.json；目录不可用时返回空串。"""
+    """缓存文件路径：<缓存目录>/dongpian_<name>.json；目录不可用时返回空串。"""
     folder = _cache_dir()
     if not folder:
         return ""
     return os.path.join(folder, "%s_%s.json" % (_CACHE_PREFIX, name))
+
+
+def _diag_write(kind: str, info: Dict[str, Any]) -> None:
+    """把入口耗时写进 dongpian_diag.json，排查"明明有缓存还是慢"用。"""
+    path = _cache_file("diag")
+    if not path:
+        return
+    try:
+        data = _file_read(path)
+        data[kind] = info
+        data["module_ago_ms"] = int((time.time() - _MODULE_TS) * 1000)
+        _file_write(path, data)
+    except Exception:
+        pass
 
 
 def _cleanup_tmp(path: str) -> None:
@@ -1495,10 +1510,15 @@ class Spider(_BaseSpider):
             "ts": time.time(),
         }
 
+    @property
+    def _host_key(self) -> str:
+        """缓存里认站点用：去掉首尾空白与结尾斜杠、忽略大小写，避免配置写法不同就失效。"""
+        return _text(self._host).strip().rstrip("/").lower()
+
     def _home_snapshot(self) -> Dict[str, Any]:
         snap = _file_read(_cache_file("home"), _HOME_FILE_MAX_AGE)
         # 文件名不带 host，就靠文件里的 host 字段认：换站点后的旧数据不认
-        if _text(snap.get("host")) != self._host:
+        if _text(snap.get("host")) != self._host_key:
             return {}
         if _as_list(snap.get("class")) and _as_list(snap.get("list")):
             return snap
@@ -1507,7 +1527,7 @@ class Spider(_BaseSpider):
     def _store_home(self, payload: Dict[str, Any]) -> None:
         # 空结果不落盘：宁可继续用旧文件，也不要把"拉挂了"写成缓存
         if _as_list(payload.get("list")):
-            _file_write(_cache_file("home"), dict(payload, host=self._host))
+            _file_write(_cache_file("home"), dict(payload, host=self._host_key))
 
     def _refresh_home_bg(self) -> None:
         """后台把首页重拉一遍并覆盖缓存文件，用户不等这一次网络。"""
@@ -1530,15 +1550,22 @@ class Spider(_BaseSpider):
         _spawn_bg("home", work)
 
     def homeContent(self, filter: Any = False) -> Dict[str, Any]:
+        started = time.time()
         snap = self._home_snapshot()
         if snap:
             # 有文件缓存：立即按缓存返回，后台同时刷新，下次进首页就是新数据
             self._refresh_home_bg()
-            return {
+            result = {
                 "class": _as_list(snap.get("class")),
                 "filters": _as_dict(snap.get("filters")),
                 "list": _as_list(snap.get("list")),
             }
+            _diag_write("home", {
+                "ms": int((time.time() - started) * 1000), "hit": True,
+                "class": len(result["class"]), "list": len(result["list"]),
+                "dir": _cache_dir(),
+            })
+            return result
         try:
             boot, feed = self._fetch_home_pair()
         except Exception:
@@ -1550,6 +1577,15 @@ class Spider(_BaseSpider):
             payload = {"class": classes, "filters": {},
                        "list": [], "ts": time.time()}
         self._store_home(payload)
+        raw = _file_read(_cache_file("home"), 0.0)
+        _diag_write("home", {
+            "ms": int((time.time() - started) * 1000), "hit": False,
+            "class": len(payload.get("class") or []),
+            "list": len(payload.get("list") or []), "dir": _cache_dir(),
+            # 命中失败时把两边的 host 都记下来，方便判断是"没拉成功"还是"host 对不上"
+            "host": self._host_key, "file_host": _text(raw.get("host")),
+            "file_ts": raw.get("ts"),
+        })
         return {"class": payload["class"], "filters": payload["filters"],
                 "list": payload["list"]}
 
@@ -1561,30 +1597,54 @@ class Spider(_BaseSpider):
         return vods
 
     def _store_home_video(self, vods: Any) -> None:
+        """更新榜落盘：每次调用都写（便于在手机上确认接口有没有被调到）。
+
+        拉到空结果时保留上一次的好数据，不让一次失败把缓存清成空的。
+        """
+        path = _cache_file("homevideo")
         items = _as_list(vods)
-        if items:
-            _file_write(_cache_file("homevideo"),
-                        {"list": items, "ts": time.time(), "host": self._host})
+        previous = _as_list(_file_read(path, _HOME_FILE_MAX_AGE).get("list"))
+        _file_write(path, {
+            "list": items or previous,
+            "ts": time.time(),
+            "host": self._host_key,
+            "ok": bool(items),
+            "note": "ok" if items else "empty",
+        })
 
     def homeVideoContent(self) -> Dict[str, Any]:
-        """首页影片列表：先读文件缓存秒出，后台刷新更新榜。"""
+        """首页影片列表：有缓存秒出；没有视频缓存时先用首页那份顶上，不等网络。"""
+        started = time.time()
         snap = _file_read(_cache_file("homevideo"), _HOME_FILE_MAX_AGE)
         cached = (_as_list(snap.get("list"))
-                  if _text(snap.get("host")) == self._host else [])
+                  if _text(snap.get("host")) == self._host_key else [])
+
+        def refresh() -> None:
+            try:
+                self._store_home_video(self._load_home_video())
+            except Exception:
+                pass
+
         if cached:
-            def work() -> None:
+            _spawn_bg("homevideo", refresh)
+            source, items = "cache", cached
+        else:
+            # 没有视频缓存：先用首页那份（同样是卡片转出来的列表）立即顶上，
+            # 不为这一栏把首页等满 home_timeout；后台再拉专用更新榜覆盖。
+            items = _as_list(self._home_snapshot().get("list"))[:self._page_size]
+            if items:
+                source = "home"
+                _spawn_bg("homevideo", refresh)
+            else:
+                source = "net"
                 try:
-                    self._store_home_video(self._load_home_video())
+                    items = _as_list(self._load_home_video())
                 except Exception:
-                    pass
-            _spawn_bg("homevideo", work)
-            return {"list": cached}
-        try:
-            vods = _as_list(self._load_home_video())
-        except Exception:
-            vods = []
-        self._store_home_video(vods)
-        return {"list": vods}
+                    items = []
+                self._store_home_video(items)
+        _diag_write("video", {"ms": int((time.time() - started) * 1000),
+                              "src": source, "list": len(items)})
+        return {"list": items}
 
     # -- 最近更新 ---------------------------------------------- #
 
