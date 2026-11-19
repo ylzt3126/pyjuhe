@@ -109,7 +109,17 @@ PARAMS_AES_KEY = "ed5fdsgucxumegqa"
 UA = "okhttp/3.12.1"
 PAGE_SIZE = 21                      # 实测一页就是 21 条
 DIRECT_MEDIA_RE = re.compile(r'(?i)\.(mp4|m3u8|flv|mkv|avi|ts|mov|mpd|m4a|wmv|rmvb)(\?.*)?$')
-WEBPAGE_URL_RE = re.compile(r'(?i)(youku\.com|v\.qq\.com|bilibili\.com|iqiyi\.com|mgtv\.com|sohu\.com|le\.com|pptv\.com)')
+WEBPAGE_HOSTS = ("youku.com", "v.qq.com", "bilibili.com", "iqiyi.com", "mgtv.com",
+                 "sohu.com", "le.com", "pptv.com")
+
+
+def is_webpage_url(url):
+    """按主机名判断是不是"需要网页嗅探"的影视站地址（避免 tjtele.com 这类误判）"""
+    try:
+        host = (urlsplit(str(url or "")).hostname or "").lower()
+    except Exception:
+        return False
+    return any(host == h or host.endswith("." + h) for h in WEBPAGE_HOSTS)
 
 # 这些 CDN 实测支持 https，而部分客户端（Android 9+）会拦明文 http 图片，统一升级
 HTTPS_CDN = ("qpic.cn", "iqiyipic.com", "hdslb.com", "ykimg.com", "sohu.com", "hitv.com",
@@ -125,15 +135,91 @@ CLASSES = [
     ("21", "剧集"),
     ("22", "综艺"),
     ("23", "动漫"),
-    ("24", "漫剧"),
-    ("26", "短剧"),
+    ("24", "短剧"),
+    ("26", "漫剧"),
 ]
 
-# 排序筛选（vodOrderBy 实测可用值）
-ORDER_FILTER = {"key": "vodOrderBy", "name": "排序",
-                "value": [{"n": "最新", "v": "最新"},
-                          {"n": "最热", "v": "最热"},
-                          {"n": "好评", "v": "好评"},]}
+# 筛选项：完全对齐 app 内的筛选行（2026-11 逐项实测，参数名为 vodClass/vodArea/vodYear/vodLang/vodOrderBy）
+ORDER_OPTIONS = ["最新", "最热", "好评"]
+YEAR_OPTIONS = [str(y) for y in range(2026, 1999, -1)]
+LANG_COMMON = ["国语", "英语", "粤语", "闽南语", "韩语", "日语", "其它"]
+LANG_MOVIE = ["国语", "英语", "粤语", "闽南语", "韩语", "日语", "法语", "德语", "其它"]
+
+# type_id -> [(请求参数, 显示名, 可选值)]
+FILTER_OPTIONS = {
+    "20": [
+        ("vodClass", "类型", ["喜剧", "爱情", "恐怖", "动作", "科幻", "剧情", "战争", "警匪",
+                              "犯罪", "动画", "奇幻", "武侠", "冒险", "枪战", "悬疑", "惊悚",
+                              "经典", "青春", "文艺", "微电影", "古装", "历史", "运动", "农村",
+                              "儿童", "网络电影"]),
+        ("vodArea", "地区", ["大陆", "香港", "台湾", "美国", "法国", "英国", "日本", "韩国",
+                             "德国", "泰国", "印度", "意大利", "西班牙", "加拿大", "其他"]),
+        ("vodYear", "年份", YEAR_OPTIONS),
+        ("vodLang", "语言", LANG_MOVIE),
+    ],
+    "21": [
+        ("vodClass", "类型", ["古装", "战争", "青春", "偶像", "喜剧", "家庭", "犯罪", "动作",
+                              "奇幻", "剧情", "历史", "经典", "乡村", "情景", "商战", "网剧", "其他"]),
+        ("vodArea", "地区", ["内地", "韩国", "香港", "台湾", "日本", "美国", "泰国", "英国",
+                             "新加坡", "其他"]),
+        ("vodYear", "年份", YEAR_OPTIONS),
+        ("vodLang", "语言", LANG_COMMON),
+    ],
+    "22": [
+        ("vodClass", "类型", ["选秀", "情感", "访谈", "播报", "旅游", "音乐", "美食", "纪实",
+                              "曲艺", "生活", "游戏互动", "财经", "求职"]),
+        ("vodArea", "地区", ["内地", "港台", "日韩", "欧美"]),
+        ("vodYear", "年份", YEAR_OPTIONS),
+        ("vodLang", "语言", LANG_COMMON),
+    ],
+    "23": [
+        ("vodClass", "类型", ["情感", "科幻", "热血", "推理", "搞笑", "冒险", "萝莉", "校园",
+                              "动作", "机战", "运动", "战争", "少年", "少女", "社会", "原创",
+                              "亲子", "益智", "励志", "其他"]),
+        ("vodArea", "地区", ["国产", "日本", "欧美", "其他"]),
+        ("vodYear", "年份", YEAR_OPTIONS),
+        ("vodLang", "语言", LANG_COMMON),
+    ],
+    "24": [
+        ("vodClass", "类型", ["重生民国", "穿越年代", "现代言情", "反转爽文", "女恋总裁",
+                              "闪婚离婚", "都市脑洞", "古装仙侠", "其它"]),
+        ("vodYear", "年份", YEAR_OPTIONS),
+    ],
+    # 26 漫剧在 app 里只有排序，没有其它筛选项
+}
+
+
+# 个别分类在 app 里用的是组合词，后端 vodArea 只认具体区域名，这里做一层别名
+FILTER_ALIAS = {
+    "22": {"vodArea": {"内地": "大陆", "港台": "香港", "日韩": "韩国"}},
+}
+
+
+def build_filters():
+    """按 type_id 生成 TVBox 的 filters 结构"""
+    out = {}
+    for tid, _name in CLASSES:
+        fl = [{"key": "vodOrderBy", "name": "排序",
+               "value": [{"n": v, "v": v} for v in ORDER_OPTIONS]}]
+        for key, label, vals in FILTER_OPTIONS.get(tid, []):
+            fl.append({"key": key, "name": label,
+                       "value": [{"n": v, "v": v} for v in vals]})
+        out[tid] = fl
+    return out
+
+
+# converUrl 里的筛选项 -> (请求参数名, 中文名)
+FILTER_MAP = [
+    ("class", "vodClass", "类型"),
+    ("area", "vodArea", "地区"),
+    ("lang", "vodLang", "语言"),
+    ("year", "vodYear", "年份"),
+    ("star", "vodStar", "主演"),
+    ("director", "vodDirector", "导演"),
+    ("state", "vodState", "状态"),
+    ("version", "vodVersion", "版本"),
+    ("extend_sort", "vodOrderBy", "排序"),
+]
 
 # converUrl 里的筛选项 -> (请求参数名, 中文名)
 FILTER_MAP = [
@@ -943,7 +1029,7 @@ class Spider(_BaseSpider):
         # 2026-11 的新后端删掉了 /api/v3/drama/getCategory，
         # 分类表改成客户端内置的固定 typeId，实测值见 CLASSES。
         classes = [{"type_id": tid, "type_name": name} for tid, name in CLASSES]
-        filters = {tid: [ORDER_FILTER] for tid, _ in CLASSES}
+        filters = build_filters()
 
         # 部分客户端首页直接用 homeContent 的 list 渲染，这里把推荐位一并带上，
         # 避免只有分类没有内容（图片自然也就出不来）。
@@ -1039,6 +1125,7 @@ class Spider(_BaseSpider):
         for _, req_key, _cn in FILTER_MAP:
             val = ext.get(req_key)
             if val:
+                val = FILTER_ALIAS.get(str(tid), {}).get(req_key, {}).get(val, val)
                 params[req_key] = str(val)
         params.setdefault("vodOrderBy", "最新")
 
@@ -1211,7 +1298,7 @@ class Spider(_BaseSpider):
         hdr = {"User-Agent": UA}
         if isinstance(headers, dict):
             hdr.update({str(k): str(v) for k, v in headers.items() if k})
-        if WEBPAGE_URL_RE.search(u):
+        if is_webpage_url(u):
             return {"parse": 1, "url": u, "header": hdr}
         return {"parse": 0, "url": u, "header": hdr}
 
