@@ -3,9 +3,11 @@
 橘汁（juziapp.hzhcbkj.cn）TVBox Spider —— AppDrama 协议实现
 
 一、这套接口是什么样的（2026-10 実测，APK: 橘汁 3.0.7.0 / com.asjdhjhd.mgd.p3）
-  1) 域名不在代码里写死，靠 ext.site 下发的 app.txt：
-         GET https://123-1349250429.cos.ap-shanghai.myqcloud.com/app.txt
-         -> {"domain":"https://juziapp.hzhcbkj.cn","enabled":true}
+  1) 域名不在代码里写死，靠 ext.site 下发的 az.txt：
+         GET http://tenxuncos.gexuanyi.top/az.txt
+         -> {"domain":"http://juziappcc.hzhcbkj.cn","enabled":true}
+      （2026-11 起配置源由 COS 的 app.txt 换成了 gexuanyi.top 的 az.txt，
+        域名也从 juziapp 换成了 juziappcc）
   2) 所有业务接口都要求一个 "公共参数请求头"：
          publicParams: {"paramsData":"<AES-CBC 的 hex>"}
      缺这个头时服务端直接返回：
@@ -86,13 +88,20 @@ EXT = {
     "dataIv": "OC1A06E197EF10CF3F6058CA7A803B5E",
     "pkg": "com.asjdhjhd.mgd.p3",
     "host": "",
-    "site": "https://123-1349250429.cos.ap-shanghai.myqcloud.com/app.txt",
+    "hosts": ["https://juziappcc.hzhcbkj.cn", "http://juziappcc.hzhcbkj.cn"],
+    "site": [
+        "http://tenxuncos.gexuanyi.top/az.txt",
+        "http://oss.gexuanyi.top/az.txt",
+        "http://oss2.gexuanyi.top/az.txt",
+        "https://1848463092.cdn.123clouddisk.com/1848463092/cct/az.txt",
+    ],
     "version": "3.0.7.0",
     "decrypt": "1",
 }
 
-# 域名发现失败时的兜底（app.txt 里出现的正式域名）
-DEFAULT_HOSTS = ["https://juziapp.hzhcbkj.cn"]
+# 域名发现失败时的兜底（app.txt/az.txt 里下发过的正式域名）
+DEFAULT_HOSTS = ["https://juziappcc.hzhcbkj.cn", "http://juziappcc.hzhcbkj.cn",
+                 "http://juziapp.hzhcbkj.cn"]
 
 # 公共参数请求头用的固定 AES 密钥（key 与 iv 相同，全系列 AppDrama 客户端通用）
 PARAMS_AES_KEY = "ed5fdsgucxumegqa"
@@ -109,6 +118,22 @@ HTTPS_CDN = ("qpic.cn", "iqiyipic.com", "hdslb.com", "ykimg.com", "sohu.com", "h
 
 # 分类里这些不是正常点播内容，首页不展示
 SKIP_CATS = ("公告", "文章", "直播")
+
+# 2026-11 新后端的分类表（实测 typeId1 与内容的对应关系，app 内不再下发分类接口）
+CLASSES = [
+    ("20", "电影"),
+    ("21", "剧集"),
+    ("22", "综艺"),
+    ("23", "动漫"),
+    ("24", "漫剧"),
+    ("26", "短剧"),
+]
+
+# 排序筛选（vodOrderBy 实测可用值）
+ORDER_FILTER = {"key": "vodOrderBy", "name": "排序",
+                "value": [{"n": "最新", "v": "最新"},
+                          {"n": "最热", "v": "最热"},
+                          {"n": "好评", "v": "好评"},]}
 
 # converUrl 里的筛选项 -> (请求参数名, 中文名)
 FILTER_MAP = [
@@ -567,6 +592,8 @@ class Spider(_BaseSpider):
         self.zone_key = _SHARED.get("zone_key", "")
         self.zone_t = _SHARED.get("zone_t", 0)
         self._hv, self._hv_t = None, 0
+        # 线路探活结果：dead=True 时所有接口直接返回提示，不再反复超时把界面卡住
+        self.dead, self.last_error = False, ""
         self._ctx = ssl._create_unverified_context()
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=self._ctx))
@@ -601,13 +628,50 @@ class Spider(_BaseSpider):
 
         # 1) 域名：ext.host 优先，其次 app.txt 下发
         self.host = str(cfg.get("host") or "").rstrip("/")
+        for h in (cfg.get("hosts") or []):
+            h = str(h or "").strip().rstrip("/")
+            if h and h not in self.hosts:
+                self.hosts.append(h)
         if not self.host:
             self.host = self._discover_host()
 
-        # 2) 换一次性签名公钥（失败不致命：退回 ext.publicKey 继续试）
-        if not self.zone_key:
+        # 2) 线路探活：配置源（app.txt）不可用、所有候选域名都拒连时，
+        #    直接标记失效，让 TVBox 首页立刻给出提示，而不是卡在超时里一片空白。
+        self._probe_hosts()
+
+        # 3) 换一次性签名公钥（失败不致命：退回 ext.publicKey 继续试）
+        if not self.dead and not self.zone_key:
             self._exchange_zone_key()
         return ""
+
+    def _candidate_hosts(self):
+        """可用的候选域名：ext.host -> ext.hosts -> app.txt 下发 -> 内置兜底
+        明文 http 的域名会优先尝试 https（部分 Android 客户端会拦 cleartext）"""
+        out = []
+        for h in [self.host] + list(self.hosts) + list(DEFAULT_HOSTS):
+            h = str(h or "").strip().rstrip("/")
+            if not h:
+                continue
+            for c in (["https://" + h[7:], h] if h.startswith("http://") else [h]):
+                if c not in out:
+                    out.append(c)
+        return out
+
+    def _probe_hosts(self):
+        """用一条最轻的 JSON 接口判定域名是否还活着；只要有任何 HTTP 响应就算活。"""
+        self.dead, self.last_error = False, ""
+        errs = []
+        for h in self._candidate_hosts()[:6]:
+            code, raw = self._http("GET", h + "/api/v3/drama/getCategory?orderBy=type_id",
+                                   self._json_headers(), timeout=6)
+            if code and raw:
+                self.host = h
+                return True
+            errs.append("%s -> %s" % (urlsplit(h).hostname or h,
+                                      ("HTTP %s" % code) if code else "连接被重置/无法解析"))
+        self.dead = True
+        self.last_error = "；".join(errs)
+        return False
 
     def _discover_host(self):
         for site in self.sites:
@@ -771,7 +835,7 @@ class Spider(_BaseSpider):
     def _post_proto(self, path, params, retry=True):
         """返回 (code, msg, data_bytes)"""
         body = self._secure_body(params)
-        code, raw = self._http("POST", self.host + path, self._proto_headers(), body, timeout=20)
+        code, raw = self._http("POST", self.host + path, self._proto_headers(), body, timeout=10)
         if code == 0 and retry:                       # 网络异常，换域名再来一次
             self._rotate_host()
             return self._post_proto(path, params, retry=False)
@@ -802,7 +866,7 @@ class Spider(_BaseSpider):
     # ------------------------------------------------------------------ #
     def _secure_json(self, path, retry=True):
         """GET 加密 JSON 接口；data 是双重 AES-ECB 密文时自动解开"""
-        code, raw = self._http("GET", self.host + path, self._json_headers(), timeout=20)
+        code, raw = self._http("GET", self.host + path, self._json_headers(), timeout=10)
         if code == 0 and retry:
             self._rotate_host()
             return self._secure_json(path, retry=False)
@@ -857,51 +921,29 @@ class Spider(_BaseSpider):
             "vod_area": d.get("area", ""),
         }
 
+    def _notice(self):
+        """线路全挂时放在首页的提示项，省得用户对着空界面猜"""
+        return {
+            "vod_id": "0",
+            "vod_name": "橘汁接口已失效",
+            "vod_pic": "",
+            "vod_remarks": "请更新源",
+            "vod_year": "",
+            "vod_area": "",
+            "vod_content": "域名探活结果：" + (self.last_error or "所有候选域名均无响应"),
+        }
+
     # ------------------------------------------------------------------ #
     # 首页分类 + 筛选
     # ------------------------------------------------------------------ #
     def homeContent(self, filter=False):
-        classes, filters = [], {}
-        cats = self._secure_json("/api/v3/drama/getCategory?orderBy=type_id")
-        if isinstance(cats, str):
-            try:
-                cats = json.loads(cats)
-            except Exception:
-                cats = []
-        if not isinstance(cats, list):
-            cats = []
-
-        for cat in cats:
-            if not isinstance(cat, dict):
-                continue
-            name = str(cat.get("name") or "").strip()
-            if not name or name in SKIP_CATS:
-                continue
-            tid = str(cat.get("id") or "")
-            if not tid:
-                continue
-            classes.append({"type_id": tid, "type_name": name})
-
-            conver = cat.get("converUrl") or cat.get("conver_url") or ""
-            if isinstance(conver, str) and conver.strip().startswith("{"):
-                try:
-                    conver = json.loads(conver)
-                except Exception:
-                    conver = {}
-            if not isinstance(conver, dict):
-                continue
-            fl = []
-            for src_key, req_key, cn in FILTER_MAP:
-                raw = conver.get(src_key)
-                if not raw:
-                    continue
-                vals = [v.strip() for v in str(raw).split(",") if v.strip()]
-                if not vals:
-                    continue
-                fl.append({"key": req_key, "name": cn,
-                           "value": [{"n": v, "v": v} for v in vals]})
-            if fl:
-                filters[tid] = fl
+        if self.dead:
+            return {"class": [{"type_id": "0", "type_name": "线路已失效"}],
+                    "filters": {}, "list": [self._notice()]}
+        # 2026-11 的新后端删掉了 /api/v3/drama/getCategory，
+        # 分类表改成客户端内置的固定 typeId，实测值见 CLASSES。
+        classes = [{"type_id": tid, "type_name": name} for tid, name in CLASSES]
+        filters = {tid: [ORDER_FILTER] for tid, _ in CLASSES}
 
         # 部分客户端首页直接用 homeContent 的 list 渲染，这里把推荐位一并带上，
         # 避免只有分类没有内容（图片自然也就出不来）。
@@ -915,6 +957,8 @@ class Spider(_BaseSpider):
     # 首页推荐（tag/list 的 carousels + sections）
     # ------------------------------------------------------------------ #
     def homeVideoContent(self):
+        if self.dead:
+            return {"list": [self._notice()]}
         now = time.time()
         if self._hv and now - self._hv_t < 300:
             return self._hv
@@ -982,6 +1026,8 @@ class Spider(_BaseSpider):
             page = max(int(pg), 1)
         except Exception:
             page = 1
+        if self.dead:
+            return {"page": page, "pagecount": page, "limit": PAGE_SIZE, "total": 0, "list": []}
         ext = extend if isinstance(extend, dict) else {}
         if isinstance(extend, str) and extend.strip().startswith("{"):
             try:
@@ -1034,6 +1080,8 @@ class Spider(_BaseSpider):
             vid = str(ids or "")
         vid = vid.split("/")[0].strip()
         if not vid:
+            return {"list": []}
+        if self.dead:
             return {"list": []}
 
         acode, msg, data = self._post_proto("/api/proto/v5/drama/getDetail", {"id": vid})
@@ -1098,6 +1146,9 @@ class Spider(_BaseSpider):
             page = 1
         if not k:
             return {"list": [], "page": page, "pagecount": page, "limit": PAGE_SIZE, "total": 0}
+        if self.dead:
+            return {"list": [self._notice()], "page": page, "pagecount": page,
+                    "limit": PAGE_SIZE, "total": 0}
 
         acode, msg, data = self._post_proto("/api/proto/v5/drama/search", {
             "searchKeys": k, "page": str(page), "pagesize": str(PAGE_SIZE),
@@ -1119,6 +1170,8 @@ class Spider(_BaseSpider):
     def playerContent(self, flag, id, vipFlags=None):
         pid = str(id or "").strip()
         if not pid:
+            return {"parse": 0, "url": ""}
+        if self.dead:
             return {"parse": 0, "url": ""}
         if pid.lower().startswith("http"):
             return self._play_ret(pid)
@@ -1224,9 +1277,19 @@ def playerContent(flag, id, vipFlags=None):
 # ======================================================================================
 if __name__ == "__main__":
     import re as _re
+    # 用法：python py_juzhi.py https://新域名
+    # 拿到新域名后先用这条命令探活，通了再写进 TVBox 配置的 ext.host
+    if len(sys.argv) > 1 and sys.argv[1].startswith("http"):
+        EXT["host"] = sys.argv[1].rstrip("/")
     s = Spider()
     s.init(json.dumps(EXT, ensure_ascii=False))
     print("host =", s.host, "| zoneKey len =", len(s.zone_key))
+    print("dead =", s.dead, "| last_error =", s.last_error or "-")
+    try:
+        code, body = s._http("GET", EXT["site"][0], {"User-Agent": UA}, timeout=8)
+        print("az.txt -> HTTP", code, "|", body[:120].decode("utf-8", "ignore").replace("\n", " "))
+    except Exception as e:
+        print("az.txt -> ERR", repr(e))
 
     hc = s.homeContent(True)
     print("\n[homeContent] 分类 %d 个，带筛选 %d 个" % (len(hc["class"]), len(hc["filters"])))
